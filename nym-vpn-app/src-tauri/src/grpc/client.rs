@@ -10,13 +10,15 @@ use super::{
     events::MixnetEvent,
     gateway::{Gateway, GatewayType},
     tunnel::TunnelState,
+    socks5::{Socks5Settings, HttpRpcSettings},
 };
 
 use anyhow::{Result, anyhow};
 use nym_vpn_proto::proto::{
-    AccountControllerState, ConnectRequest, Dns, GetAccountLinksRequest, ListGatewaysRequest,
-    Location, StoreAccountRequest, TunnelEvent, TunnelState as PTunnelState, UserAgent,
-    VpnAccountStoreRequest, nym_vpn_service_client::NymVpnServiceClient, tunnel_event::Event,
+    AccountControllerState, ConnectRequest, Dns, ExitNode, GetAccountLinksRequest,
+    ListGatewaysRequest, Location, StoreAccountRequest, TunnelEvent, TunnelState as PTunnelState,
+    UserAgent, VpnAccountStoreRequest, nym_vpn_service_client::NymVpnServiceClient,
+    tunnel_event::Event, EnableSocks5Request,
 };
 use once_cell::sync::Lazy;
 use std::{
@@ -641,6 +643,67 @@ impl GrpcClient {
         debug!("disabled vpnd network statistics collection");
         info!("restart vpnd (service) required for the change to take effect");
         Ok(())
+    }
+
+    /// Enable SOCKS5 proxy
+    #[instrument(skip_all)]
+    pub async fn enable_socks5(
+        &self,
+        socks5_settings: Socks5Settings,
+        http_rpc_settings: HttpRpcSettings,
+        exit_node: NodeConnect,
+    ) -> Result<(), VpndError> {
+        let mut vpnd = self.vpnd().await?;
+
+        let exit_node: ExitNode = exit_node.into();
+        
+        vpnd.enable_socks5(Request::new(EnableSocks5Request {
+            socks5_settings: Some(nym_vpn_proto::proto::Socks5Settings {
+                listen_address: socks5_settings.listen_address,
+            }),
+            http_rpc_settings: Some(nym_vpn_proto::proto::HttpRpcSettings {
+                listen_address: http_rpc_settings.listen_address,
+            }),
+            exit: Some(exit_node),
+        })).await.map_err(|e| {
+            error!("failed to enable SOCKS5 proxy: {}", e);
+            VpndError::GrpcError(e)
+        })?;
+
+        info!("SOCKS5 proxy enabled");
+        Ok(())
+    }
+
+    /// Disable SOCKS5 proxy
+    #[instrument(skip_all)]
+    pub async fn disable_socks5(&self) -> Result<(), VpndError> {
+        let mut vpnd = self.vpnd().await?;
+
+        vpnd.disable_socks5(()).await.map_err(|e| {
+            error!("failed to disable SOCKS5 proxy: {}", e);
+            VpndError::GrpcError(e)
+        })?;
+
+        info!("SOCKS5 proxy disabled");
+        Ok(())
+    }
+
+    /// Get SOCKS5 proxy status
+    #[instrument(skip_all)]
+    pub async fn get_socks5_status(&self) -> Result<nym_vpn_proto::proto::Socks5Status, VpndError> {
+        let mut vpnd = self.vpnd().await?;
+
+        let response = vpnd
+            .get_socks5_status(())
+            .await
+            .map_err(|e| {
+                error!("failed to get SOCKS5 status: {}", e);
+                VpndError::GrpcError(e)
+            })?
+            .into_inner();
+
+        debug!("SOCKS5 status: {:?}", response);
+        Ok(response)
     }
 
     async fn listen_to_stream<S>(mut stream: Streaming<S>, tx: Sender<TunnelEvent>)
