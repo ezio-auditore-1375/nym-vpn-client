@@ -72,6 +72,7 @@ use std::{
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use lazy_static::lazy_static;
 use nym_platform_metadata::SysInfo;
+use nym_vpn_store::keys::wireguard::WireguardKeysDb;
 use sentry::ClientInitGuard;
 use tokio::{runtime::Runtime, sync::Mutex};
 
@@ -105,6 +106,7 @@ lazy_static! {
     static ref OFFLINE_MONITOR_HANDLE: Mutex<Option<OfflineMonitorHandle>> = Mutex::new(None);
     static ref STATE_MACHINE_HANDLE: Mutex<Option<StateMachineHandle>> = Mutex::new(None);
     static ref ACCOUNT_CONTROLLER_HANDLE: Mutex<Option<AccountControllerHandle>> = Mutex::new(None);
+    static ref WIREGUARD_KEYS_DB: Mutex<Option<WireguardKeysDb>> = Mutex::new(None);
     static ref STATISTICS_CONTROLLER_HANDLE: Mutex<Option<StatisticsControllerHandle>> =
         Mutex::new(None);
     static ref NETWORK_ENVIRONMENT: Mutex<Option<nym_vpn_network_config::Network>> =
@@ -355,6 +357,21 @@ pub fn forgetAccountRaw(path: String) -> Result<(), VpnError> {
     RUNTIME.block_on(account::raw::forget_account_raw(&path))
 }
 
+/// Force a rotation of the wireguard keys
+#[allow(non_snake_case)]
+#[uniffi::export]
+pub fn rotateKeys() -> Result<(), VpnError> {
+    RUNTIME.block_on(account::rotate_keys())
+}
+
+/// Force a rotation of the wireguard keys
+/// This is a version that can be called when the account controller is not running.
+#[allow(non_snake_case)]
+#[uniffi::export]
+pub fn rotateKeysRaw(path: String) -> Result<(), VpnError> {
+    RUNTIME.block_on(account::raw::rotate_keys_raw(&path))
+}
+
 /// Get the device identity
 #[allow(non_snake_case)]
 #[uniffi::export]
@@ -447,15 +464,17 @@ async fn start_vpn_inner(config: Box<VPNConfig>) -> Result<(), VpnError> {
 
     let account_controller_tx = account::get_command_sender().await?;
     let account_controller_state = account::get_state_receiver().await?;
+    let wireguard_key_db = account::get_wireguard_key_db().await?;
 
     let statistics_event_sender = stats::get_events_sender().await?;
 
     // Once we have established that the account is ready, we can start the state machine.
     state_machine::init_state_machine(
         config,
-        network_env,
+        Box::new(network_env),
         account_controller_tx,
         account_controller_state,
+        wireguard_key_db,
         statistics_event_sender,
     )
     .await

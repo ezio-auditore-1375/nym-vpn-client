@@ -7,7 +7,7 @@ use bip39::Mnemonic;
 use futures::{FutureExt, StreamExt, future::Fuse, pin_mut};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
-    sync::{broadcast, mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Duration, Instant},
 };
@@ -23,7 +23,7 @@ use nym_vpn_account_controller::{
     AccountCommandSender, AccountController, AccountControllerConfig, AccountStateReceiver,
     AvailableTicketbooks, NyxdClient,
 };
-use nym_vpn_api_client::{api_urls_to_urls, fronted_http_client};
+use nym_vpn_api_client::api_urls_to_urls;
 use nym_vpn_lib::{
     UserAgent, VpnTopologyProvider,
     gateway_directory::{self, GatewayCache, GatewayCacheHandle, GatewayClient},
@@ -36,7 +36,7 @@ use nym_vpn_lib_types::{
     NymVpnDevice, NymVpnNetwork, NymVpnUsage, ParsedAccountLinks, StoreAccountRequest,
     SystemMessage, TargetState, TunnelEvent, TunnelState, VpnServiceConfig, VpnServiceInfo,
 };
-use nym_vpn_network_config::Network;
+use nym_vpn_network_config::{DiscoveryRefresher, DiscoveryRefresherEvent, Network};
 use nym_vpn_store::types::{StorableAccount, StoredAccountMode};
 
 use super::{
@@ -101,6 +101,7 @@ pub enum VpnServiceCommand {
     ),
     IsAccountStored(oneshot::Sender<bool>, ()),
     ForgetAccount(oneshot::Sender<Result<(), AccountCommandError>>, ()),
+    RotateKeys(oneshot::Sender<Result<(), AccountCommandError>>, ()),
     GetAccountIdentity(
         oneshot::Sender<Result<Option<String>, AccountCommandError>>,
         (),
@@ -154,7 +155,7 @@ pub struct NymVpnServiceParameters {
 
 pub struct NymVpnService {
     // The network environment
-    network_env: Box<Network>,
+    network_tx: watch::Sender<Box<Network>>,
 
     // The user agent used for HTTP request
     user_agent: UserAgent,
@@ -213,6 +214,12 @@ pub struct NymVpnService {
 
     // Gateway cache handle
     gateway_cache_handle: GatewayCacheHandle,
+
+    // Discovery refresher event receiver
+    discovery_refresher_event_rx: mpsc::UnboundedReceiver<DiscoveryRefresherEvent>,
+
+    // Discovery refresher join handle
+    discovery_refresher_join_handle: JoinHandle<()>,
 
     // VPN service shutdown token.
     shutdown_token: CancellationToken,
@@ -365,6 +372,7 @@ impl NymVpnService {
         // These are used to interact with the account controller
         let account_command_tx = account_controller.get_command_sender();
         let account_state_rx = account_controller.get_state_receiver();
+        let wireguard_keys_db = account_controller.get_wireguard_keys_storage();
         let account_controller_handle = tokio::task::spawn(account_controller.run());
 
         // Statistics collection setup
@@ -419,11 +427,12 @@ impl NymVpnService {
                     reason: e.to_string(),
                 })?;
 
+        let (network_tx, network_rx) = watch::channel(parameters.network_env.clone());
         let nym_config = NymConfig {
-            config_path: Some(config_dir),
+            config_path: Some(config_dir.clone()),
             data_path: Some(network_data_dir.clone()),
             gateway_config: gateway_config.clone(),
-            network_env: *parameters.network_env.clone(),
+            network_rx,
         };
 
         let gateway_directory_client =
@@ -448,29 +457,34 @@ impl NymVpnService {
             }
         })?;
 
-        let validator_client =
-            fronted_http_client(urls, Some(parameters.user_agent.clone()), None, None)
-                .await
-                .map_err(|err| {
-                    tracing::error!("Failed to create HTTP client: {err:?}");
-                    AccountControllerError::Initialization {
-                        reason: err.to_string(),
-                    }
-                })?;
-
-        let urls = parameters.network_env.nym_api_urls_as_urls().ok_or(
-            AccountControllerError::Initialization {
-                reason: "Nym API URLs are empty".to_string(),
-            },
-        )?;
-
         let topology_provider = VpnTopologyProvider::new(
             urls,
-            validator_client,
+            parameters.user_agent.clone(),
             false,
             services_shutdown_token.child_token(),
-        );
+        )
+        .await?;
         topology_provider.fetch().await;
+
+        let (discovery_refresher_event_tx, discovery_refresher_event_rx) =
+            mpsc::unbounded_channel();
+        let (discovery_refresher_command_tx, discovery_refresher_command_rx) =
+            mpsc::unbounded_channel();
+        let discovery_refresher_join_handle = DiscoveryRefresher::spawn(
+            config_dir.clone(),
+            parameters.network_env,
+            discovery_refresher_command_rx,
+            discovery_refresher_event_tx,
+            connectivity_handle.clone(),
+            services_shutdown_token.child_token(),
+        )
+        .await
+        .map_err(|err| {
+            tracing::error!("Failed to start Discovery Refresher: {err:?}");
+            AccountControllerError::Initialization {
+                reason: err.to_string(),
+            }
+        })?;
 
         let state_machine_handle = TunnelStateMachine::spawn(
             command_receiver,
@@ -484,6 +498,8 @@ impl NymVpnService {
             gateway_cache_handle.clone(),
             topology_provider,
             connectivity_handle,
+            discovery_refresher_command_tx,
+            wireguard_keys_db,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             route_handler,
             state_machine_shutdown_token.child_token(),
@@ -492,7 +508,7 @@ impl NymVpnService {
         .map_err(Error::StateMachine)?;
 
         Ok(Self {
-            network_env: parameters.network_env,
+            network_tx,
             user_agent: parameters.user_agent,
             vpn_command_rx,
             tunnel_event_tx,
@@ -515,6 +531,8 @@ impl NymVpnService {
             state_machine_shutdown_token,
             gateway_cache_handle,
             gateway_cache_join_handle,
+            discovery_refresher_event_rx,
+            discovery_refresher_join_handle,
             sentry_enabled: parameters.sentry_enabled,
             network_statistics_enabled: parameters.netstats_enabled,
             statistics_event_sender,
@@ -536,6 +554,9 @@ impl NymVpnService {
                 }
                 Some(account_state) = account_state_rx.next() => {
                     self.handle_account_state_change(account_state);
+                }
+                Some(event) = self.discovery_refresher_event_rx.recv() => {
+                    self.handle_discovery_refresher_event(event);
                 }
                 _ = &mut self.tunnel_settings_update_timer => {
                     self.update_tunnel_settings();
@@ -581,15 +602,19 @@ impl NymVpnService {
         self.socks5_service.shutdown().await;
 
         if let Err(e) = self.account_controller_handle.await {
-            tracing::error!("Failed to join on account controller handle: {}", e);
+            tracing::error!("Failed to join on account controller handle: {e}");
         }
 
         if let Err(e) = self.statistics_controller_handle.await {
-            tracing::error!("Failed to join on statistics controller handle: {}", e);
+            tracing::error!("Failed to join on statistics controller handle: {e}");
         }
 
         if let Err(e) = self.gateway_cache_join_handle.await {
-            tracing::error!("Failed to join on gateway cache handle: {}", e);
+            tracing::error!("Failed to join on gateway cache handle: {e}");
+        }
+
+        if let Err(e) = self.discovery_refresher_join_handle.await {
+            tracing::error!("Failed to join on discovery refresher handle: {e}");
         }
 
         tracing::info!("Exiting vpn service run loop");
@@ -660,6 +685,18 @@ impl NymVpnService {
             .is_err()
         {
             tracing::error!("Failed to send tunnel event");
+        }
+    }
+
+    fn handle_discovery_refresher_event(&mut self, event: DiscoveryRefresherEvent) {
+        match event {
+            DiscoveryRefresherEvent::NewNetwork(new_network) => {
+                tracing::info!("Network environment updated");
+                let _ = self.network_tx.send_replace(new_network);
+            }
+            DiscoveryRefresherEvent::Error(_error) => {
+                // todo: handle error?
+            }
         }
     }
 
@@ -768,6 +805,9 @@ impl NymVpnService {
             VpnServiceCommand::ForgetAccount(tx, ()) => {
                 let _ = tx.send(self.handle_forget_account().await);
             }
+            VpnServiceCommand::RotateKeys(tx, ()) => {
+                let _ = tx.send(self.handle_rotate_keys().await);
+            }
             VpnServiceCommand::GetAccountIdentity(tx, ()) => {
                 let _ = tx.send(self.handle_get_account_identity().await);
             }
@@ -843,6 +883,7 @@ impl NymVpnService {
 
     async fn handle_info(&self) -> VpnServiceInfo {
         let bin_info = nym_bin_common::bin_info_local_vergen!();
+        let network_env = self.network_tx.borrow();
 
         VpnServiceInfo {
             version: bin_info.build_version.to_string(),
@@ -850,8 +891,8 @@ impl NymVpnService {
             triple: bin_info.cargo_triple.to_string(),
             platform: self.user_agent.platform.clone(),
             git_commit: bin_info.commit_sha.to_string(),
-            nym_network: NymNetworkDetails::from(self.network_env.nym_network.clone()),
-            nym_vpn_network: NymVpnNetwork::from(self.network_env.nym_vpn_network.clone()),
+            nym_network: NymNetworkDetails::from(network_env.nym_network.clone()),
+            nym_vpn_network: NymVpnNetwork::from(network_env.nym_vpn_network.clone()),
         }
     }
 
@@ -930,7 +971,8 @@ impl NymVpnService {
     }
 
     async fn handle_get_system_messages(&self) -> Vec<SystemMessage> {
-        self.network_env
+        self.network_tx
+            .borrow()
             .nym_vpn_network
             .system_messages
             .messages
@@ -941,7 +983,8 @@ impl NymVpnService {
     }
 
     async fn handle_get_network_compatibility(&self) -> Option<NetworkCompatibility> {
-        self.network_env
+        self.network_tx
+            .borrow()
             .system_configuration
             .as_ref()
             .and_then(|sc| sc.min_supported_app_versions.clone())
@@ -949,7 +992,8 @@ impl NymVpnService {
     }
 
     async fn handle_get_feature_flags(&self) -> Option<FeatureFlags> {
-        self.network_env
+        self.network_tx
+            .borrow()
             .feature_flags
             .clone()
             .map(FeatureFlags::from)
@@ -1335,6 +1379,17 @@ impl NymVpnService {
         self.account_command_tx.forget_account().await
     }
 
+    async fn handle_rotate_keys(&mut self) -> Result<(), AccountCommandError> {
+        // TODO: temporary, until key rotation can be done while connected
+        if self.tunnel_state != TunnelState::Disconnected {
+            return Err(AccountCommandError::internal(
+                "Unable to rotate keys while connected",
+            ));
+        }
+
+        self.account_command_tx.rotate_keys().await
+    }
+
     async fn handle_get_account_identity(&self) -> Result<Option<String>, AccountCommandError> {
         self.account_command_tx.get_account_id().await
     }
@@ -1348,7 +1403,8 @@ impl NymVpnService {
             .await
             .map_err(|_| AccountLinksError::FailedToParseAccountLinks)?;
 
-        self.network_env
+        self.network_tx
+            .borrow()
             .nym_vpn_network
             .account_management
             .clone()

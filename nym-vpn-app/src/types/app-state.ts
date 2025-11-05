@@ -4,12 +4,10 @@ import { StateAction } from '../contexts';
 import {
   AccountLinks,
   ConnectingState,
-  Country,
-  ErrorKey,
   FeatureFlags,
-  Gateway,
   NetworkCompat,
   NetworkEnv,
+  SelectedNode,
   ThemeMode,
   Tunnel,
   TunnelError,
@@ -17,18 +15,16 @@ import {
   VpnMode,
   VpndStatus,
 } from './tauri';
-import { AccountState, TunnelState } from './utils';
+import {
+  AccountState,
+  AppError,
+  CodeDependency,
+  DaemonStatus,
+  ProgressMsg,
+  TunnelState,
+} from './utils';
 
-export type CodeDependency = {
-  name: string;
-  version?: string;
-  licenses: string[];
-  repository?: string;
-  authors: string[];
-  copyright?: string;
-};
-
-export type DaemonStatus = 'ok' | 'non-compat' | 'down';
+export type StateDispatch = Dispatch<StateAction>;
 
 // early stage state used to initialize the main app-state
 export type InitState = {
@@ -36,6 +32,8 @@ export type InitState = {
   welcomeChecked: boolean;
   vpnMode: VpnMode;
   vpnd: VpndStatus;
+  entryNode: SelectedNode;
+  exitNode: SelectedNode;
 };
 
 export type AppState = {
@@ -69,8 +67,8 @@ export type AppState = {
   // error monitoring
   monitoring: boolean;
   desktopNotifications: boolean;
-  entryNode: Country | Gateway;
-  exitNode: Country | Gateway;
+  entryNode: SelectedNode;
+  exitNode: SelectedNode;
   rootFontSize: number;
   codeDepsJs: CodeDependency[];
   codeDepsRust: CodeDependency[];
@@ -86,14 +84,6 @@ export type AppState = {
   quic: boolean;
   // current user setting
   domainFronting: boolean;
-};
-
-export type ProgressMsg = 'canceling';
-
-export type StateDispatch = Dispatch<StateAction>;
-
-export type AppError = {
-  message: string;
-  key: ErrorKey;
-  data?: Record<string, string> | null;
+  // whether the user has seen the streaming optimized label feature alert
+  streamingOptimizedLabelSeen: boolean;
 };

@@ -1,6 +1,6 @@
 import dayjs from 'dayjs';
 import {
-  DefaultCountry,
+  DefaultNode,
   DefaultRootFontSize,
   DefaultThemeMode,
 } from '../../constants';
@@ -11,14 +11,13 @@ import {
   AppState,
   CodeDependency,
   ConnectingState,
-  Country,
   DaemonStatus,
   FeatureFlags,
-  Gateway,
   NetworkCompat,
   NetworkEnv,
   NodeHop,
   ProgressMsg,
+  SelectedNode,
   ThemeMode,
   Tunnel,
   TunnelAction,
@@ -56,7 +55,7 @@ export type StateAction =
   | { type: 'system-theme-changed'; theme: UiTheme }
   | {
       type: 'set-node';
-      payload: { hop: NodeHop; node: Country | Gateway };
+      payload: { hop: NodeHop; node: SelectedNode };
     }
   | { type: 'set-root-font-size'; size: number }
   | { type: 'set-code-deps-js'; dependencies: CodeDependency[] }
@@ -73,7 +72,8 @@ export type StateAction =
   | { type: 'set-account-error'; error: AppError | null }
   | { type: 'set-backend-flags'; flags: FeatureFlags }
   | { type: 'set-quic'; enabled: boolean }
-  | { type: 'set-domain-fronting'; enabled: boolean };
+  | { type: 'set-domain-fronting'; enabled: boolean }
+  | { type: 'set-streaming-optimized-label-seen'; seen: boolean };
 
 export const initialState: AppState = {
   initialized: false,
@@ -94,8 +94,8 @@ export const initialState: AppState = {
   autoConnect: false,
   monitoring: false,
   desktopNotifications: true,
-  entryNode: DefaultCountry,
-  exitNode: DefaultCountry,
+  entryNode: DefaultNode,
+  exitNode: DefaultNode,
   rootFontSize: DefaultRootFontSize,
   codeDepsRust: [],
   codeDepsJs: [],
@@ -112,6 +112,7 @@ export const initialState: AppState = {
     gatewayUpdateVersion: null,
     flags: {},
   },
+  streamingOptimizedLabelSeen: false,
 };
 
 export function reducer(state: AppState, action: StateAction): AppState {
@@ -340,6 +341,11 @@ export function reducer(state: AppState, action: StateAction): AppState {
       return {
         ...state,
         welcomeChecked: action.checked,
+      };
+    case 'set-streaming-optimized-label-seen':
+      return {
+        ...state,
+        streamingOptimizedLabelSeen: action.seen,
       };
     case 'set-backend-flags':
       return {

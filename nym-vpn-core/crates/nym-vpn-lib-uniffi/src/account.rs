@@ -10,7 +10,10 @@ use nym_vpn_api_client::types::{Platform, VpnAccount};
 use nym_vpn_lib::storage::VpnClientOnDiskStorage;
 use nym_vpn_lib_types::{AccountControllerState, RegisterAccountResponse};
 use nym_vpn_network_config::Network;
-use nym_vpn_store::{account::Mnemonic, keys::device::DeviceKeyStore};
+use nym_vpn_store::{
+    account::Mnemonic,
+    keys::{device::DeviceKeyStore, wireguard::WireguardKeysDb},
+};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -99,11 +102,13 @@ async fn start_account_controller(
 
     let command_sender = account_controller.get_command_sender();
     let state_receiver = account_controller.get_state_receiver();
+    let wireguard_key_db = account_controller.get_wireguard_keys_storage();
     let account_controller_handle = tokio::spawn(account_controller.run());
 
     Ok(AccountControllerHandle {
         command_sender,
         state_receiver,
+        wireguard_key_db,
         handle: account_controller_handle,
         shutdown_token,
     })
@@ -112,6 +117,7 @@ async fn start_account_controller(
 pub(super) struct AccountControllerHandle {
     command_sender: AccountCommandSender,
     state_receiver: AccountStateReceiver,
+    wireguard_key_db: WireguardKeysDb,
     handle: JoinHandle<()>,
     shutdown_token: CancellationToken,
 }
@@ -153,6 +159,16 @@ pub(super) async fn get_command_sender() -> Result<AccountCommandSender, VpnErro
 pub(super) async fn get_state_receiver() -> Result<AccountStateReceiver, VpnError> {
     if let Some(guard) = &*ACCOUNT_CONTROLLER_HANDLE.lock().await {
         Ok(guard.state_receiver.clone())
+    } else {
+        Err(VpnError::InvalidStateError {
+            details: "Account controller is not running.".to_owned(),
+        })
+    }
+}
+
+pub(super) async fn get_wireguard_key_db() -> Result<WireguardKeysDb, VpnError> {
+    if let Some(guard) = &*ACCOUNT_CONTROLLER_HANDLE.lock().await {
+        Ok(guard.wireguard_key_db.clone())
     } else {
         Err(VpnError::InvalidStateError {
             details: "Account controller is not running.".to_owned(),
@@ -229,6 +245,14 @@ pub(super) async fn forget_account() -> Result<(), VpnError> {
         .map_err(VpnError::from)
 }
 
+pub(super) async fn rotate_keys() -> Result<(), VpnError> {
+    get_command_sender()
+        .await?
+        .rotate_keys()
+        .await
+        .map_err(VpnError::from)
+}
+
 pub(super) async fn get_account_id() -> Result<Option<String>, VpnError> {
     Ok(get_command_sender().await?.get_account_id().await?)
 }
@@ -278,7 +302,7 @@ pub(crate) mod raw {
         response::{NymVpnAccountResponse, NymVpnRegisterAccountResponse},
         types::{Device, DeviceStatus, VpnAccountMode},
     };
-    use nym_vpn_store::account::AccountInformationStorage;
+    use nym_vpn_store::{account::AccountInformationStorage, keys::wireguard::DB_NAME};
 
     async fn setup_account_storage(path: &str) -> Result<VpnClientOnDiskStorage, VpnError> {
         assert_account_controller_not_running().await?;
@@ -389,6 +413,24 @@ pub(crate) mod raw {
         Ok(())
     }
 
+    async fn remove_wireguard_keys_storage_raw(data_dir: &Path) -> Result<(), VpnError> {
+        let db_path = data_dir.join(DB_NAME);
+        match tokio::fs::remove_file(&db_path).await {
+            Ok(_) => tracing::trace!("Removed file: {}", db_path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::trace!("File not found: {}", db_path.display())
+            }
+            Err(e) => {
+                trace_err_chain!(e, "Failed to remove file: {}", db_path.display());
+
+                return Err(VpnError::InternalError {
+                    details: e.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     async fn create_vpn_api_client() -> Result<VpnApiClient, VpnError> {
         let network_env = environment::current_environment_details().await?;
         let user_agent = crate::user_agent::construct_user_agent();
@@ -478,11 +520,21 @@ pub(crate) mod raw {
         remove_credential_storage_raw(&path_buf).await?;
 
         // Then remove the rest of the files, that we own indirectly
-        nym_vpn_account_controller::remove_files_for_account(&path_buf)
+        nym_vpn_account_controller::remove_files_for_account(&path_buf, true)
             .await
             .map_err(|err| VpnError::Storage {
                 details: err.to_string(),
             })?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn rotate_keys_raw(path: &str) -> Result<(), VpnError> {
+        let path_buf =
+            PathBuf::from_str(path).map_err(|err| VpnError::InvalidAccountStoragePath {
+                details: err.to_string(),
+            })?;
+        remove_wireguard_keys_storage_raw(&path_buf).await?;
 
         Ok(())
     }

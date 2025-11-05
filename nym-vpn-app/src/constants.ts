@@ -1,4 +1,4 @@
-import { Country } from './types';
+import { SelectedNode } from './types';
 
 export const AppName = 'NymVPN';
 export const TunnelStateEvent = 'tunnel-state';
@@ -10,9 +10,12 @@ export const DefaultRootFontSize = 14; // in px
 // NOTE: when fresh country data is get from daemon, the selected countries
 // are checked against it and if needed it is automatically switched to
 // available ones
-export const DefaultCountry: Country = {
-  name: 'Switzerland',
-  code: 'CH',
+export const DefaultNode: SelectedNode = {
+  type: 'country',
+  node: {
+    name: 'Switzerland',
+    code: 'CH',
+  },
 };
 export const DefaultThemeMode = 'system';
 // ⚠ keep those in sync with the theme definition in `styles.css`
@@ -35,7 +38,7 @@ export const LocationDetailsArticle =
 export const ModesDetailsArticle =
   'https://support.nym.com/hc/articles/24326365096721-What-s-the-difference-between-Fast-and-Anonymous-mode';
 export const SentryHomePage = 'https://sentry.io/';
-export const GatewaysCacheDuration = 300; // 5min
+export const GatewaysCacheDuration = 120; // 2min
 export const NymVpnPricingUrl = 'https://nym.com/pricing';
 export const SentryPrivacyPolicyUrl = 'https://sentry.io/privacy/';
 export const AnonNetworkStatsUrl = 'https://nym.com/anonymous-stats';
@@ -45,3 +48,8 @@ export const IpInfoIoUrl = 'https://ipinfo.io';
 export const SupportServerLocationUrl =
   'https://support.nym.com/hc/en-us/articles/26448676449297-How-is-server-location-determined-by-NymVPN';
 export const NetworkExplorerNodeUrl = 'https://nym.com/explorer/nym-node';
+export const countriesWithRegions = ['US', 'CA', 'AU', 'MX', 'BR', 'IN', 'CN'];
+export const ResidentialIpServersUrl =
+  'https://support.nym.com/hc/en-us/articles/35279486714641-Why-can-t-I-access-streaming-services-while-using-NymVPN';
+export const LocationAccuracyLink =
+  'https://support.nym.com/hc/en-us/articles/26448676449297-How-is-server-location-determined-by-NymVPN';

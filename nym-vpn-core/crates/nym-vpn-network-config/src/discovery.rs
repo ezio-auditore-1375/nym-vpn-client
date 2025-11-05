@@ -4,6 +4,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::LazyLock,
+    time::SystemTime,
 };
 
 use crate::{
@@ -95,20 +96,7 @@ impl Discovery {
             .map_err(|source| Error::GetFileStaleness { path, source })
     }
 
-    pub async fn fetch(network_name: &str) -> Result<Self> {
-        // allow panic because a broken bootstrap url means everything will fail anyways.
-        let api_urls = Self::default_vpn_api_urls();
-
-        let urls = api_urls_to_urls(api_urls).map_err(Error::CreateVpnApiClient)?;
-
-        let resolver_overrides = ResolverOverrides::from_urls(&urls)
-            .await
-            .map_err(Error::CreateVpnApiClient)?;
-
-        let client = VpnApiClient::new(urls, empty_user_agent(), Some(&resolver_overrides))
-            .await
-            .map_err(Error::CreateVpnApiClient)?;
-
+    pub async fn fetch(client: &VpnApiClient, network_name: &str) -> Result<Self> {
         tracing::debug!("Fetching nym network discovery");
         let discovery = client
             .get_wellknown_discovery(network_name)
@@ -134,11 +122,23 @@ impl Discovery {
         crate::serialization::deserialize_from_json_file(path)
     }
 
-    pub(super) fn write_to_file(&self, config_dir: &Path) -> Result<()> {
+    pub(super) fn write_to_file(
+        &self,
+        config_dir: &Path,
+        modified_at: Option<SystemTime>,
+    ) -> Result<()> {
         let path = Self::path(config_dir, &self.network_name);
         tracing::debug!("Writing discovery file to: {}", path.display());
 
-        crate::serialization::serialize_to_json_file(path, self)
+        let file = crate::serialization::serialize_to_json_file(path, self)?;
+
+        if let Some(modified_at) = modified_at
+            && let Err(e) = file.set_modified(modified_at)
+        {
+            tracing::error!("Failed to set modified time for discovery file: {e}");
+        }
+
+        Ok(())
     }
 
     pub(super) async fn ensure_exists(config_dir: &Path, network_name: &str) -> Result<Self> {
@@ -151,12 +151,30 @@ impl Discovery {
                     trace_err_chain!(e, "Failed to read discovery file");
                 }
 
-                let discovery = Self::fetch(network_name).await.or_else(|e| {
-                    match Self::default_discovery(network_name) {
+                let client = Self::create_client(None).await?;
+
+                match Self::fetch(&client, network_name).await {
+                    Ok(discovery) => {
+                        discovery
+                            .write_to_file(config_dir, None)
+                            .inspect_err(|err| {
+                                trace_err_chain!(err, "Failed to write discovery file");
+                            })?;
+                        Ok(discovery)
+                    }
+                    Err(e) => match Self::default_discovery(network_name) {
                         Some(default_discovery) => {
                             tracing::warn!(
                                 "Failed to fetch remote discovery file: {e}, creating a default one"
                             );
+                            // Ensure that discovery cache created from default discovery is always considered stale.
+                            let modified_at = SystemTime::now().checked_sub(MAX_FILE_AGE);
+
+                            default_discovery
+                                .write_to_file(config_dir, modified_at)
+                                .inspect_err(|err| {
+                                    trace_err_chain!(err, "Failed to write default discovery file");
+                                })?;
                             Ok(default_discovery)
                         }
                         None => {
@@ -165,14 +183,8 @@ impl Discovery {
                             );
                             Err(e)
                         }
-                    }
-                })?;
-
-                discovery.write_to_file(config_dir).inspect_err(|err| {
-                    trace_err_chain!(err, "Failed to write discovery file");
-                })?;
-
-                Ok(discovery)
+                    },
+                }
             }
             Err(e) => {
                 trace_err_chain!(e, "Failed to read discovery file");
@@ -211,7 +223,7 @@ impl Discovery {
     pub async fn update_nym_network_file(&self, config_dir: &Path) -> Result<()> {
         self.fetch_nym_network_details()
             .await?
-            .write_to_file(config_dir)
+            .write_to_file(config_dir, None)
     }
 
     fn default_discovery(network_name: &str) -> Option<Self> {
@@ -256,6 +268,17 @@ impl Discovery {
                 })
                 .collect()
         }
+    }
+
+    pub async fn create_client(
+        resolver_overrides: Option<&ResolverOverrides>,
+    ) -> Result<VpnApiClient> {
+        let urls =
+            api_urls_to_urls(Self::default_vpn_api_urls()).map_err(Error::CreateVpnApiClient)?;
+
+        VpnApiClient::new(urls, empty_user_agent(), resolver_overrides)
+            .await
+            .map_err(Error::CreateVpnApiClient)
     }
 }
 
@@ -330,7 +353,7 @@ impl TryFrom<NymWellknownDiscoveryItemResponse> for Discovery {
     }
 }
 
-fn empty_user_agent() -> UserAgent {
+pub fn empty_user_agent() -> UserAgent {
     UserAgent {
         application: String::new(),
         version: String::new(),
@@ -384,7 +407,8 @@ mod tests {
     #[tokio::test]
     async fn test_discovery_fetch() {
         let network_name = "mainnet";
-        let discovery = Discovery::fetch(network_name).await.unwrap();
+        let client = Discovery::create_client(None).await.unwrap();
+        let discovery = Discovery::fetch(&client, network_name).await.unwrap();
         assert_eq!(discovery.network_name, network_name);
     }
 
@@ -411,7 +435,10 @@ mod tests {
     }
 
     async fn test_discovery_equality(discovery: Discovery) {
-        let fetched = Discovery::fetch(&discovery.network_name).await.unwrap();
+        let client = Discovery::create_client(None).await.unwrap();
+        let fetched = Discovery::fetch(&client, &discovery.network_name)
+            .await
+            .unwrap();
 
         // Only compare the base fields
         assert_eq!(discovery.network_name, fetched.network_name);

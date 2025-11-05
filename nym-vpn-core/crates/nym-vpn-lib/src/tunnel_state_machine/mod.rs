@@ -35,10 +35,10 @@ use nym_offline_monitor::ConnectivityHandle;
 use nym_registration_client::MixnetClientConfig;
 use nym_statistics::{StatisticsSender, events::StatisticsEvent};
 use nym_vpn_account_controller::{AccountCommandSender, AccountStateReceiver};
-use nym_vpn_network_config::Network;
+use nym_vpn_network_config::{DiscoveryRefresherCommand, Network};
 use nym_vpn_store::keys::wireguard::WireguardKeysDb;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -427,7 +427,7 @@ pub struct SharedState {
     firewall: Firewall,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     dns_handler: DnsHandlerHandle,
-    connectivity_handle: nym_offline_monitor::ConnectivityHandle,
+    connectivity_handle: ConnectivityHandle,
     /// Filtering resolver handle
     #[cfg(target_os = "macos")]
     filtering_resolver: resolver::ResolverHandle,
@@ -444,6 +444,7 @@ pub struct SharedState {
     statistics_event_sender: StatisticsSender,
     gateway_cache_handle: GatewayCacheHandle,
     topology_provider: VpnTopologyProvider,
+    discovery_refresher_command_tx: mpsc::UnboundedSender<DiscoveryRefresherCommand>,
     wg_keys_db: WireguardKeysDb,
 }
 
@@ -465,7 +466,7 @@ pub struct NymConfig {
     pub config_path: Option<PathBuf>,
     pub data_path: Option<PathBuf>,
     pub gateway_config: GatewayDirectoryConfig,
-    pub network_env: Network,
+    pub network_rx: watch::Receiver<Box<Network>>,
 }
 
 pub struct TunnelStateMachine {
@@ -496,6 +497,8 @@ impl TunnelStateMachine {
         gateway_cache_handle: GatewayCacheHandle,
         topology_provider: VpnTopologyProvider,
         connectivity_handle: ConnectivityHandle,
+        discovery_refresher_command_tx: mpsc::UnboundedSender<DiscoveryRefresherCommand>,
+        wg_keys_db: WireguardKeysDb,
         #[cfg(not(any(target_os = "android", target_os = "ios")))] route_handler: RouteHandler,
         #[cfg(target_os = "ios")] tun_provider: Arc<dyn OSTunProvider>,
         #[cfg(target_os = "android")] tun_provider: Arc<dyn AndroidTunProvider>,
@@ -517,10 +520,6 @@ impl TunnelStateMachine {
             dns_handler_shutdown_token.child_token(),
         )
         .map_err(Error::CreateDnsHandler)?;
-
-        let wg_keys_db = WireguardKeysDb::init(nym_config.data_path.clone())
-            .await
-            .map_err(Error::WireguardKeyDb)?;
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let firewall = Firewall::from_args(FirewallArguments {
@@ -552,6 +551,7 @@ impl TunnelStateMachine {
             statistics_event_sender,
             gateway_cache_handle,
             topology_provider,
+            discovery_refresher_command_tx,
             wg_keys_db,
         };
 
@@ -717,8 +717,11 @@ pub enum Error {
     #[error("failed to create icmp probe")]
     CreateIcmpProbe(#[source] nym_connection_monitor::IcmpProbeError),
 
-    #[error("failed to configure icmp probe due to missing IPv4 interface address")]
-    IcmpProbeRequiresIPv4Addr,
+    #[error("failed to create tcp probe")]
+    CreateTcpProbe(#[source] nym_connection_monitor::TcpProbeError),
+
+    #[error("failed to configure probe due to missing IPv4 interface address")]
+    ProbeRequiresIPv4Addr,
 }
 
 impl Error {
@@ -759,7 +762,8 @@ impl Error {
             Self::WireguardKeyDb(e) => ErrorStateReason::Internal(e.to_string()),
             Self::GatewayDirectoryClient(e) => ErrorStateReason::Internal(e.to_string()),
             Self::CreateIcmpProbe(e) => ErrorStateReason::Internal(e.to_string()),
-            Self::IcmpProbeRequiresIPv4Addr => ErrorStateReason::Internal(self.to_string()),
+            Self::CreateTcpProbe(e) => ErrorStateReason::Internal(e.to_string()),
+            Self::ProbeRequiresIPv4Addr => ErrorStateReason::Internal(self.to_string()),
         })
     }
 }
@@ -771,10 +775,10 @@ impl tunnel::Error {
                 GatewayDirectoryError::SameEntryAndExitGateway { .. } => {
                     Some(ErrorStateReason::SameEntryAndExitGateway)
                 }
-                GatewayDirectoryError::PerformantEntryGatewayUnavailable { .. } => {
+                GatewayDirectoryError::EntryGatewayUnavailable { .. } => {
                     Some(ErrorStateReason::PerformantEntryGatewayUnavailable)
                 }
-                GatewayDirectoryError::PerformantExitGatewayUnavailable { .. } => {
+                GatewayDirectoryError::ExitGatewayUnavailable { .. } => {
                     Some(ErrorStateReason::PerformantExitGatewayUnavailable)
                 }
                 GatewayDirectoryError::SelectEntryGateway(source) => match source {

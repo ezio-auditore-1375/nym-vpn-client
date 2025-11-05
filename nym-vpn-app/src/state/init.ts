@@ -3,19 +3,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart';
-import {
-  DefaultCountry,
-  DefaultRootFontSize,
-  DefaultThemeMode,
-} from '../constants';
+import { DefaultRootFontSize, DefaultThemeMode } from '../constants';
 import { getJsLicenses, getRustLicenses } from '../data';
 import { kvGet } from '../kvStore';
 import {
   AccountLinks,
   CodeDependency,
-  Country,
   FeatureFlags,
-  Gateway,
   InitState,
   NetworkCompat,
   StateDispatch,
@@ -27,6 +21,7 @@ import {
 import { updateAccountState, updateTunnel } from './update';
 import { TauriReq, fireRequests } from './helper';
 
+const defaultNetStats = window._APP.defaultNetstats;
 const defaultQuic = window._APP.defaultQuic;
 const defaultDomFront = window._APP.defaultDomainFronting;
 
@@ -53,50 +48,6 @@ export async function initFirstBatch(
       updateTunnel(state, dispatch);
     },
   };
-
-  const getEntryNodeRq: TauriReq<() => Promise<Gateway | Country | undefined>> =
-    {
-      name: 'getEntryNode',
-      request: () => kvGet<Gateway | Country>('entry-node'),
-      onFulfilled: (node) => {
-        if (node) {
-          dispatch({
-            type: 'set-node',
-            payload: {
-              hop: 'entry',
-              node,
-            },
-          });
-        } else {
-          console.info(
-            'no entry node saved, using default country',
-            DefaultCountry,
-          );
-        }
-      },
-    };
-
-  const getExitNodeRq: TauriReq<() => Promise<Gateway | Country | undefined>> =
-    {
-      name: 'getExitNode',
-      request: () => kvGet<Gateway | Country>('exit-node'),
-      onFulfilled: (node) => {
-        if (node) {
-          dispatch({
-            type: 'set-node',
-            payload: {
-              hop: 'exit',
-              node,
-            },
-          });
-        } else {
-          console.info(
-            'no exit node saved, using default country',
-            DefaultCountry,
-          );
-        }
-      },
-    };
 
   const getAccountStateRq: TauriReq<() => Promise<TAccountState | undefined>> =
     {
@@ -157,9 +108,7 @@ export async function initFirstBatch(
     },
   };
 
-  const getDesktopNotificationsRq: TauriReq<
-    () => Promise<boolean | undefined>
-  > = {
+  const getDesktopNotificationsRq: TauriReq<() => Promise<boolean | null>> = {
     name: 'getDesktopNotificationsRq',
     request: () => kvGet<boolean>('desktop-notifications'),
     onFulfilled: (enabled) => {
@@ -170,7 +119,7 @@ export async function initFirstBatch(
     },
   };
 
-  const getRootFontSizeRq: TauriReq<() => Promise<number | undefined>> = {
+  const getRootFontSizeRq: TauriReq<() => Promise<number | null>> = {
     name: 'getRootFontSize',
     request: () => kvGet<number>('ui-root-font-size'),
     onFulfilled: (size) => {
@@ -215,7 +164,7 @@ export async function initFirstBatch(
     },
   };
 
-  const getIpv6SupportRq: TauriReq<() => Promise<boolean | undefined>> = {
+  const getIpv6SupportRq: TauriReq<() => Promise<boolean | null>> = {
     name: 'getIpv6Support',
     request: () => kvGet<boolean>('disable-ipv6'),
     onFulfilled: (disabled) => {
@@ -225,38 +174,53 @@ export async function initFirstBatch(
     },
   };
 
-  const getQuicRq: TauriReq<() => Promise<boolean | undefined>> = {
+  const getQuicRq: TauriReq<() => Promise<boolean | null>> = {
     name: 'getQuicRq',
     request: () => kvGet<boolean>('quic-enabled'),
     onFulfilled: (enabled) => {
-      dispatch({ type: 'set-quic', enabled: enabled || defaultQuic });
+      dispatch({
+        type: 'set-quic',
+        enabled: enabled !== null ? enabled : defaultQuic,
+      });
     },
   };
 
-  const getDomainFrontingRq: TauriReq<() => Promise<boolean | undefined>> = {
+  const getDomainFrontingRq: TauriReq<() => Promise<boolean | null>> = {
     name: 'getDomainFrontingRq',
     request: () => kvGet<boolean>('domain-fronting-enabled'),
     onFulfilled: (enabled) => {
       dispatch({
         type: 'set-domain-fronting',
-        enabled: enabled || defaultDomFront,
+        enabled: enabled !== null ? enabled : defaultDomFront,
       });
     },
   };
 
-  const getNetworkStatsRq: TauriReq<() => Promise<boolean | undefined>> = {
+  const getNetworkStatsRq: TauriReq<() => Promise<boolean | null>> = {
     name: 'getNetworkStats',
     request: () => kvGet<boolean>('network-stats-enabled'),
     onFulfilled: (enabled) => {
-      if (enabled !== undefined) {
-        dispatch({ type: 'set-network-stats', enabled });
-      }
+      dispatch({
+        type: 'set-network-stats',
+        enabled: enabled !== null ? enabled : defaultNetStats,
+      });
+    },
+  };
+
+  const getStreamingOptimizedLabelSeenRq: TauriReq<
+    () => Promise<boolean | null>
+  > = {
+    name: 'getStreamingOptimizedLabelSeenRq',
+    request: () => kvGet<boolean>('streaming-optimized-label-seen'),
+    onFulfilled: (seen) => {
+      dispatch({
+        type: 'set-streaming-optimized-label-seen',
+        seen: seen || false,
+      });
     },
   };
 
   let requests: TauriReq<never>[] = [
-    getEntryNodeRq,
-    getExitNodeRq,
     getVersionRq,
     getThemeRq,
     getRootFontSizeRq,
@@ -268,6 +232,7 @@ export async function initFirstBatch(
     getNetworkStatsRq,
     getQuicRq,
     getDomainFrontingRq,
+    getStreamingOptimizedLabelSeenRq,
   ];
 
   if (initState.vpnd !== 'down') {

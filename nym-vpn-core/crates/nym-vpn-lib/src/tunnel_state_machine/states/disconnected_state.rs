@@ -4,13 +4,13 @@
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use nym_common::trace_err_chain;
-
 use crate::tunnel_state_machine::{
     NextTunnelState, PrivateTunnelState, SharedState, TunnelCommand, TunnelStateHandler,
     states::{ConnectingState, OfflineState},
     tunnel::Tombstone,
 };
+use nym_common::trace_err_chain;
+use nym_vpn_network_config::DiscoveryRefresherCommand;
 
 pub struct DisconnectedState;
 
@@ -19,16 +19,21 @@ impl DisconnectedState {
         tombstone: Option<Tombstone>,
         shared_state: &mut SharedState,
     ) -> (Box<dyn TunnelStateHandler>, PrivateTunnelState) {
+        // Configure Discovery Referesher to not use any resolver overrides and to resume operation
+        shared_state
+            .discovery_refresher_command_tx
+            .send(DiscoveryRefresherCommand::UseResolverOverrides(None))
+            .ok();
+        shared_state
+            .discovery_refresher_command_tx
+            .send(DiscoveryRefresherCommand::Pause(false))
+            .ok();
+
         #[cfg(target_os = "macos")]
         Self::reset_dns(shared_state).await;
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         Self::reset_firewall_policy(shared_state);
-
-        let _ = shared_state
-            .account_command_tx
-            .set_vpn_api_firewall_down()
-            .await;
 
         if let Err(e) = shared_state
             .account_command_tx
@@ -37,6 +42,10 @@ impl DisconnectedState {
         {
             trace_err_chain!(e, "Failed to unset static API addresses");
         }
+        let _ = shared_state
+            .account_command_tx
+            .set_vpn_api_firewall_down()
+            .await;
 
         // Drop tombstone to close tunnel devices.
         let _ = tombstone;

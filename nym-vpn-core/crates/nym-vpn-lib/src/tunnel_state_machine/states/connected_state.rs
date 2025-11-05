@@ -12,13 +12,6 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "macos")]
 use crate::tunnel_state_machine::resolver::LOCAL_DNS_RESOLVER;
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-use nym_common::trace_err_chain;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use nym_firewall::{AllowedClients, AllowedEndpoint, Endpoint, FirewallPolicy, TransportProtocol};
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use nym_vpn_lib_types::TunnelConnectionData;
-
 use crate::tunnel_state_machine::{
     ConnectionData, NextTunnelState, PrivateActionAfterDisconnect, PrivateTunnelState, SharedState,
     TunnelCommand, TunnelInterface, TunnelStateHandler,
@@ -28,6 +21,13 @@ use crate::tunnel_state_machine::{
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::tunnel_state_machine::{Error, Result, gateway_ext::GatewayExt};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use nym_common::trace_err_chain;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use nym_firewall::{AllowedClients, AllowedEndpoint, Endpoint, FirewallPolicy, TransportProtocol};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use nym_vpn_lib_types::TunnelConnectionData;
+use nym_vpn_network_config::DiscoveryRefresherCommand;
 
 use super::ErrorState;
 
@@ -55,7 +55,7 @@ impl ConnectedState {
             if let TunnelConnectionData::Wireguard(ref wg) = connection_data.tunnel {
                 if shared_state.tunnel_settings.bridges_enabled() {
                     // this will be `Some` if we get to the connected state with bridges enabled.
-                    wg.entry_bridge_addr
+                    wg.entry_bridge_addr.as_ref().map(|addr| addr.remote_addr)
                 } else {
                     Some(wg.entry.endpoint)
                 }
@@ -100,6 +100,21 @@ impl ConnectedState {
                 shared_state,
             );
         }
+
+        // Configure Discovery Referesher to not use any resolver overrides and to resume operation
+        shared_state
+            .discovery_refresher_command_tx
+            .send(DiscoveryRefresherCommand::UseResolverOverrides(None))
+            .ok();
+        shared_state
+            .discovery_refresher_command_tx
+            .send(DiscoveryRefresherCommand::Pause(false))
+            .ok();
+        shared_state
+            .account_command_tx
+            .set_resolver_overrides(None)
+            .await
+            .ok();
 
         // We can use slower network fetches now
         shared_state.topology_provider.use_network(true).await;
@@ -271,10 +286,6 @@ impl TunnelStateHandler for ConnectedState {
                     TunnelMonitorEvent::Down { error_state_reason, reply_tx } => {
                         _ = reply_tx.send(());
                         self.handle_tunnel_down(error_state_reason, shared_state).await
-                    }
-                    TunnelMonitorEvent::NewNetworkEnv { network } => {
-                        shared_state.nym_config.network_env = *network;
-                        NextTunnelState::SameState(self)
                     }
                     _ => {
                         NextTunnelState::SameState(self)

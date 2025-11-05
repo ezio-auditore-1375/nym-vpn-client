@@ -11,6 +11,17 @@ echo "[BuildCore] CORE_ROOT=${CORE_ROOT}"
 echo "[BuildCore] APPLE_ROOT=${APPLE_ROOT}"
 echo "[BuildCore] CLIENT_ROOT=${CLIENT_ROOT}"
 
+# Configure sccache if available
+if command -v sccache &>/dev/null; then
+  export RUSTC_WRAPPER="$(which sccache)"
+  export SCCACHE_DIR="${HOME}/.cache/sccache"
+  export SCCACHE_CACHE_SIZE="50G"
+  export SCCACHE_IDLE_TIMEOUT="0"
+  echo "[BuildCore] Using sccache at ${RUSTC_WRAPPER}"
+else
+  echo "[BuildCore] ⚠️ sccache not found, skipping cache setup"
+fi
+
 # 1) Build iOS
 cd "${CORE_ROOT}"
 make -f iOS.mk
@@ -32,10 +43,10 @@ rm -rf "${RPC_DEST}"
 cp -R "${RPC_SRC}" "${RPC_DEST}"
 echo "[BuildCore] Copied NymVPNRpc → ${RPC_DEST}"
 
-# 5) Copy the universal nym-vpnd → apple Daemon as net.nymtech.vpn.helper
+# 5) Copy the universal nym-vpnd → apple Daemon
 VPND_SRC="${CORE_ROOT}/upload/mac/nym-vpnd"
 VPND_DEST_DIR="${APPLE_ROOT}/Daemon"
-VPND_DEST="${VPND_DEST_DIR}/net.nymtech.vpn.helper"
+VPND_DEST="${VPND_DEST_DIR}/nym-vpnd"
 if [[ ! -f "${VPND_SRC}" ]]; then
   echo "[BuildCore][ERROR] ${VPND_SRC} not found. Make sure macOS.mk builds vpnd-universal."
   exit 1
@@ -44,5 +55,22 @@ mkdir -p "${VPND_DEST_DIR}"
 cp -f "${VPND_SRC}" "${VPND_DEST}"
 chmod +x "${VPND_DEST}"
 echo "[BuildCore] Copied nym-vpnd → ${VPND_DEST}"
+
+# 6) Copy the universal nym-setup → apple Daemon
+NYM_SETUP_SRC="${CORE_ROOT}/upload/mac/nym-setup"
+NYM_SETUP_DEST="${VPND_DEST_DIR}/nym-setup"
+if [[ ! -f "${NYM_SETUP_SRC}" ]]; then
+  echo "[BuildCore][ERROR] ${NYM_SETUP_SRC} not found. Make sure macOS.mk builds nym-setup-universal."
+  exit 1
+fi
+cp -f "${NYM_SETUP_SRC}" "${NYM_SETUP_DEST}"
+chmod +x "${NYM_SETUP_DEST}"
+echo "[BuildCore] Copied nym-setup → ${VPND_DEST}"
+
+# Print sccache stats
+if command -v sccache &>/dev/null; then
+  echo "[BuildCore] 🧱 sccache stats:"
+  sccache --show-stats || true
+fi
 
 echo "[BuildCore] ✅ Finished."

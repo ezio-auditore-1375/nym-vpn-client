@@ -1,72 +1,59 @@
-import { useEffect, useState } from 'react';
+import { useDeferredValue } from 'react';
 import { useNavigate } from 'react-router';
 import { Trans, useTranslation } from 'react-i18next';
 import { motion } from 'motion/react';
 import {
-  UiCountry,
+  SelectedUiNode,
   UiGateway,
-  UiGatewaysByCountry,
   useDialog,
   useMainDispatch,
   useMainState,
   useNodeList,
   useNodeListState,
 } from '../../contexts';
-import { NodeHop, StateDispatch, isGateway } from '../../types';
+import { NodeHop, StateDispatch } from '../../types';
 import { Link, PageAnim, TextInput } from '../../ui';
 import { kvSet } from '../../kvStore';
-import { uiNodeToRaw } from '../../contexts/node-list/util';
+import { uiNodeToSelectedNode } from '../../contexts/node-list/util';
 import { useI18nError } from '../../hooks';
 import { routes } from '../../router';
 import LocationDetailsDialog from './LocationDetailsDialog';
-import { NodeList } from './list';
+import { NodeList, useFilterList } from './list';
 
 function Node({ node }: { node: NodeHop }) {
   const { backendFlags, vpnMode, quic } = useMainState();
   const dispatch = useMainDispatch() as StateDispatch;
 
   const { isOpen, close } = useDialog();
-  const { nodes, loading, gateways, error } = useNodeList();
-  const { setFocused, reset: resetSaved, addToExpanded } = useNodeListState();
+  const { loading, error } = useNodeList();
+  const {
+    setFocused,
+    exit: exitNodeList,
+    entry: entryNodeList,
+    reset: resetSaved,
+    addToExpanded,
+  } = useNodeListState();
+  const expanded =
+    node === 'entry' ? entryNodeList.expanded : exitNodeList.expanded;
+  const focused =
+    node === 'entry' ? entryNodeList.focused : exitNodeList.focused;
+
   const { tE } = useI18nError();
 
-  const [uiNodes, setUiNodes] = useState<UiGatewaysByCountry[]>(nodes);
-  const [uiGateways, setUiGateways] = useState<UiGateway[]>(gateways);
-  const [search, setSearch] = useState('');
   const quicFilter =
     vpnMode === 'wg' && node === 'entry' && backendFlags.quic && quic;
 
   const navigate = useNavigate();
   const { t } = useTranslation('nodeLocation');
 
-  // refresh the UI list whenever the backend gateway data changes
-  useEffect(() => {
-    setUiNodes(nodes);
-    setUiGateways([]);
-    setSearch('');
-  }, [nodes, gateways]);
+  const { filter, nodes, gateways } = useFilterList();
+  const deferredNodes = useDeferredValue(nodes);
+  const deferredGateways = useDeferredValue(gateways);
 
-  const filter = (value: string) => {
-    if (value.length > 0) {
-      const filteredNodes = nodes.filter((node) => {
-        // toLowerCase() is used to make it case-insensitive
-        return node.i18n.toLowerCase().includes(value.toLowerCase());
-      });
-      const filteredGw = gateways.filter((gw) => {
-        return gw.name.toLowerCase().includes(value.toLowerCase());
-      });
-      setUiNodes(filteredNodes);
-      setUiGateways(filteredGw);
-    } else {
-      setUiNodes(nodes);
-      setUiGateways([]);
-    }
-    setSearch(value);
-  };
-
-  const handleSelect = async (selected: UiCountry | UiGateway) => {
+  const handleSelect = async (selected: SelectedUiNode) => {
+    const selectedNode = uiNodeToSelectedNode(selected);
     if (
-      isGateway(selected) &&
+      selectedNode.type === 'gateway' &&
       (selected.isSelected === 'exit' || selected.isSelected === 'entry')
     ) {
       return;
@@ -74,11 +61,11 @@ function Node({ node }: { node: NodeHop }) {
 
     await kvSet(
       node === 'entry' ? 'entry-node' : 'exit-node',
-      uiNodeToRaw(selected),
+      uiNodeToSelectedNode(selected),
     );
     dispatch({
       type: 'set-node',
-      payload: { hop: node, node: selected },
+      payload: { hop: node, node: selectedNode },
     });
     navigate(routes.root);
     resetSaved(node);
@@ -135,7 +122,7 @@ function Node({ node }: { node: NodeHop }) {
           data-testid="node-search-container"
         >
           {quicFilter && (
-            <p className="text-xs text-iron dark:text-bombay mb-6 select-none">
+            <p className="text-sm text-iron dark:text-bombay mb-6 select-none">
               <Trans
                 i18nKey="quic-filter-note"
                 ns="nodeLocation"
@@ -146,7 +133,6 @@ function Node({ node }: { node: NodeHop }) {
                       to={routes.antiCensorship}
                       className="text-black dark:text-white"
                       textClassName="underline-offset-2"
-                      data-testid="welcome-tos-link"
                     />
                   ),
                 }}
@@ -154,7 +140,7 @@ function Node({ node }: { node: NodeHop }) {
             </p>
           )}
           <TextInput
-            value={search}
+            defaultValue=""
             onChange={filter}
             placeholder={t('search-country')}
             leftIcon="search"
@@ -175,12 +161,14 @@ function Node({ node }: { node: NodeHop }) {
         )}
         {!loading && (
           <NodeList
-            nodes={uiNodes}
-            gateways={uiGateways}
+            nodes={deferredNodes}
+            gateways={deferredGateways}
             onSelect={handleSelect}
             onNodeDetails={handleNodeDetails}
-            node={node}
+            hop={node}
             vpnMode={vpnMode}
+            expanded={expanded}
+            focused={focused}
           />
         )}
       </PageAnim>

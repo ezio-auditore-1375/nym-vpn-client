@@ -9,14 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Implement a TCP-based probe as a fallback for connection monitoring when ICMP is unavailable. (https://github.com/nymtech/nym-vpn-client/pull/3868)
+
+### Changed
+
+- Rotate wireguard keys every 1-2 weeks, if disconnected (https://github.com/nymtech/nym-vpn-client/pull/3788)
+
+## [1.18.0] - 2025-11-03
+
+### Added
+
 - Add new CLI commands to manage sentry and anonymous network statistics collection (https://github.com/nymtech/nym-vpn-client/pull/3695)
 - Add tunnel connection monitoring (https://github.com/nymtech/nym-vpn-client/pull/3724)
 - Backend QUIC filtering for desktop (https://github.com/nymtech/nym-vpn-client/pull/3746)
 - Fallback on mixnet channel if metadata endpoint is not available (https://github.com/nymtech/nym-vpn-client/pull/3747)
+- Library exposing the command for manual wireguard key rotation (https://github.com/nymtech/nym-vpn-client/pull/3870)
 
 ### Changed
 
 - Use two keypairs (entry & exit) per gateway (https://github.com/nymtech/nym-vpn-client/pull/3591)
+- Disable system DNS resolver fallback on primary resolver failure (https://github.com/nymtech/nym-vpn-client/pull/3832)
 
 ### Fixed
 
@@ -24,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Prevent account controller from networking while state machine is in offline state (https://github.com/nymtech/nym-vpn-client/pull/3723)
 - [macOS] Log error instead of failing when removing keys from dynamic store during DNS reset. (https://github.com/nymtech/nym-vpn-client/pull/3711)
 - CLI: fix hang when calling `nym-vpnc disconnect --wait` in disconnected state. (https://github.com/nymtech/nym-vpn-client/pull/3743)
+- Don't log a warning on some expected value from the API (https://github.com/nymtech/nym-vpn-client/pull/3763)
+- Fix no gateway id problem (https://github.com/nymtech/nym-vpn-client/pull/3768)
+- [Windows] Wait for network interface addresses become usable before starting the tunnel (https://github.com/nymtech/nym-vpn-client/pull/3773)
+- Fix network environment updates not being made available for grpc clients (https://github.com/nymtech/nym-vpn-client/pull/3805)
+- Ensure that default discovery when written to disk is always considered stale (https://github.com/nymtech/nym-vpn-client/pull/3805)
+- Make discovery refresh aware of network connectivity (https://github.com/nymtech/nym-vpn-client/pull/3805)
+- Fix database cleanup when forgetting account (https://github.com/nymtech/nym-vpn-client/pull/3825)
 
 ## [1.17.0] - 2025-10-17
 

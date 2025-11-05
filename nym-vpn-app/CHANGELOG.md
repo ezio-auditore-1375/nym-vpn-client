@@ -7,12 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] - 2025-11-03
+
 ### Added
 
 - Filter server list by QUIC protocol when QUIC mode is enabled in the settings,
   entry node only
 - Add QUIC tags in server list and in home screen on the entry node input
 - Add server description and QUIC support to server details screen
+- Add US state as selectable location for entry and exit nodes
+- Group US servers by states in server list
+- Show server location like country, state and city in various places in the UI
+- Sort server list by score when searching or filtering
+- Search by city, region and server ID in server list
+- Optimize server list filtering, searching and rendering performance
+
+### Fixed
+
+- Fix a race condition at app startup that could lead to
+  selected nodes to be reset to default
+- Fix incorrect JS kv store API types
 
 ## [1.17.1] - 2025-10-20
 

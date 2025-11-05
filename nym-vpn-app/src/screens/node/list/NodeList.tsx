@@ -1,56 +1,66 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { ReactNode, memo, useCallback, useEffect, useRef } from 'react';
+import { dequal } from 'dequal';
 import { Accordion } from '@base-ui-components/react';
+import { useTranslation } from 'react-i18next';
 import { motion } from 'motion/react';
-import clsx from 'clsx';
 import {
+  Focused,
   SelectedKind,
+  SelectedUiNode,
   UiCountry,
   UiGateway,
   UiGatewaysByCountry,
+  UiRegion,
   useMainState,
   useNodeListState,
 } from '../../../contexts';
 import { NodeHop, VpnMode } from '../../../types';
-import CountryInfo from './CountryInfo';
 import GatewayItem from './GatewayItem';
-import FoldButton from './FoldButton';
+import RowHeader from './RowHeader';
 
 export type NodeListProps = {
   nodes: UiGatewaysByCountry[];
   gateways: UiGateway[];
-  onSelect: (node: UiCountry | UiGateway) => void;
+  onSelect: (node: SelectedUiNode) => void;
   onNodeDetails: (node: UiGateway) => void;
-  node: NodeHop;
+  hop: NodeHop;
   vpnMode: VpnMode;
+  expanded: string[];
+  focused: Focused | null;
 };
 
-function NodeList({
+const NodeList = memo(function NodeList({
   nodes,
   gateways,
   onSelect,
-  node,
+  hop,
   vpnMode,
   onNodeDetails,
+  expanded,
+  focused,
 }: NodeListProps) {
   const { backendFlags, quic } = useMainState();
-  const {
-    exit: exitState,
-    entry: entryState,
-    setExpanded,
-  } = useNodeListState();
-  const expanded = node === 'entry' ? entryState.expanded : exitState.expanded;
-  const focused = node === 'entry' ? entryState.focused : exitState.focused;
+  const { setExpanded } = useNodeListState();
+  const { t } = useTranslation('nodeLocation');
+
   const countriesRef = useRef<Map<string, HTMLDivElement>>(null);
+  const regionsRef = useRef<Map<string, HTMLDivElement>>(null);
   const gatewaysRef = useRef<Map<string, HTMLDivElement>>(null);
   const quicFilter =
-    vpnMode === 'wg' && node === 'entry' && backendFlags.quic && quic;
+    vpnMode === 'wg' && hop === 'entry' && backendFlags.quic && quic;
 
-  const getMap = (type: 'country' | 'gateway') => {
+  const getMap = (type: 'country' | 'region' | 'gateway') => {
     if (type === 'country') {
       if (!countriesRef.current) {
         countriesRef.current = new Map();
       }
       return countriesRef.current;
+    }
+    if (type === 'region') {
+      if (!regionsRef.current) {
+        regionsRef.current = new Map();
+      }
+      return regionsRef.current;
     }
     if (type === 'gateway') {
       if (!gatewaysRef.current) {
@@ -61,7 +71,7 @@ function NodeList({
   };
 
   const setRef = (
-    type: 'country' | 'gateway',
+    type: 'country' | 'region' | 'gateway',
     key: string,
     node: HTMLDivElement | null,
   ) => {
@@ -77,7 +87,7 @@ function NodeList({
   };
 
   const scrollToNode = useCallback(
-    (type: 'country' | 'gateway', key: string) => {
+    (type: 'country' | 'region' | 'gateway', key: string) => {
       const map = getMap(type);
       const node = map?.get(key);
       node?.scrollIntoView({
@@ -89,23 +99,23 @@ function NodeList({
     [],
   );
 
-  const handleCountrySelect = (
-    country: UiCountry,
+  const handleLocationSelect = (
+    location: UiCountry | UiRegion,
     isSelected: SelectedKind,
     gwCount: number,
   ) => {
-    if (isSelected && isSelected !== node && gwCount <= 1) {
+    if (isSelected && isSelected !== hop && gwCount <= 1) {
       // don't allow selecting a country if it has only one gateway,
       // and it's already selected by the other hop
       return;
     }
-    if (isSelected !== node && isSelected !== 'entry-and-exit') {
-      onSelect(country);
+    if (isSelected !== hop && isSelected !== 'entry-and-exit') {
+      onSelect(location);
     }
   };
 
   const onValueChange = (value: string[]) => {
-    setExpanded(node, value);
+    setExpanded(hop, value);
   };
 
   useEffect(() => {
@@ -119,6 +129,23 @@ function NodeList({
     return () => clearTimeout(timeoutId);
   }, [focused, scrollToNode]);
 
+  const PanelContent = ({
+    children,
+    animate = false,
+  }: {
+    children: ReactNode;
+    animate?: boolean;
+  }) => (
+    <motion.div
+      initial={animate && { opacity: 0, translateY: -4 }}
+      animate={animate && { opacity: 1, translateY: 0 }}
+      transition={animate ? { duration: 0.1, ease: 'easeIn' } : undefined}
+      className="flex flex-col gap-2"
+    >
+      {children}
+    </motion.div>
+  );
+
   return (
     <>
       <Accordion.Root
@@ -126,87 +153,96 @@ function NodeList({
         data-testid="node-list-accordion"
         value={expanded}
         onValueChange={onValueChange}
-        openMultiple
+        multiple
       >
-        {nodes.map(({ i18n, isSelected, gateways, country }) => (
+        {nodes.map(({ i18n, isSelected, gateways, country, regions }) => (
           <Accordion.Item
             key={country.code}
             value={country.code}
             ref={(node) => setRef('country', country.code, node)}
             data-testid={`country-accordion-item-${country.code}`}
           >
-            <div
-              className={clsx(
-                'flex flex-row justify-between',
-                ' bg-white dark:bg-charcoal',
-                'hover:bg-white/60 dark:hover:bg-charcoal/85',
-              )}
-              data-testid={`country-header-${country.code}`}
-            >
-              <div
-                className={clsx(
-                  'w-1.5 rounded-r-sm',
-                  (isSelected === node || isSelected === 'entry-and-exit') &&
-                    'bg-malachite',
-                  isSelected && isSelected !== node && 'bg-iron',
-                )}
-                data-testid={`country-selection-indicator-${country.code}`}
-                data-selected={isSelected ? isSelected : 'none'}
-              />
-              <div
-                className={clsx('grow overflow-hidden truncate py-2')}
-                onClick={() =>
-                  handleCountrySelect(country, isSelected, gateways.length)
-                }
-                data-testid={`country-select-area-${country.code}`}
-              >
-                <CountryInfo
-                  country={country}
-                  name={i18n}
-                  gwCount={gateways.length}
-                />
-              </div>
-              <Accordion.Header
-                className="flex py-2"
-                data-testid={`country-accordion-header-${country.code}`}
-              >
-                <Accordion.Trigger
-                  render={(props, state) => (
-                    <FoldButton html={props} state={state} />
-                  )}
-                />
-              </Accordion.Header>
-            </div>
+            <RowHeader
+              hop={hop}
+              isSelected={isSelected}
+              node={country}
+              i18n={i18n}
+              onClick={() =>
+                handleLocationSelect(country, isSelected, gateways.length)
+              }
+              gwCount={gateways.length}
+            />
             <Accordion.Panel
               data-testid={`country-accordion-content-${country.code}`}
+              className="w-full flex flex-col gap-3"
             >
-              <motion.div
-                initial={{ opacity: 0, translateY: -4 }}
-                animate={{ opacity: 1, translateY: 0 }}
-                transition={{ duration: 0.1, ease: 'easeIn' }}
-                className="flex flex-col gap-2"
-                data-testid={`country-gateways-container-${country.code}`}
-              >
-                {gateways.map((gateway) => (
-                  <GatewayItem
-                    key={gateway.id}
-                    ref={(node) => setRef('gateway', gateway.id, node)}
-                    node={node}
-                    gateway={gateway}
-                    onSelect={onSelect}
-                    onNodeDetails={onNodeDetails}
-                    vpnMode={vpnMode}
-                    quicLabel={quicFilter}
-                  />
-                ))}
-              </motion.div>
+              {country.code.toLowerCase() === 'us' ? (
+                regions.map((region) => (
+                  <Accordion.Item
+                    className="first:pt-3"
+                    key={region.name}
+                    value={region.name}
+                    ref={(node) => setRef('region', region.name, node)}
+                  >
+                    <RowHeader
+                      hop={hop}
+                      isSelected={region.isSelected}
+                      node={region}
+                      i18n={i18n}
+                      onClick={() => {
+                        handleLocationSelect(
+                          region,
+                          region.isSelected,
+                          region.gateways.length,
+                        );
+                      }}
+                      gwCount={region.gateways.length}
+                      sub
+                    />
+                    <Accordion.Panel>
+                      <PanelContent>
+                        {region.gateways.map((gateway) => (
+                          <GatewayItem
+                            key={gateway.id}
+                            ref={(node) => setRef('gateway', gateway.id, node)}
+                            node={hop}
+                            gateway={gateway}
+                            onSelect={onSelect}
+                            onNodeDetails={onNodeDetails}
+                            vpnMode={vpnMode}
+                            quicLabel={quicFilter}
+                          />
+                        ))}
+                      </PanelContent>
+                    </Accordion.Panel>
+                  </Accordion.Item>
+                ))
+              ) : (
+                <PanelContent>
+                  {gateways.map((gateway) => (
+                    <GatewayItem
+                      key={gateway.id}
+                      ref={(node) => setRef('gateway', gateway.id, node)}
+                      node={hop}
+                      gateway={gateway}
+                      onSelect={onSelect}
+                      onNodeDetails={onNodeDetails}
+                      vpnMode={vpnMode}
+                      quicLabel={quicFilter}
+                    />
+                  ))}
+                </PanelContent>
+              )}
             </Accordion.Panel>
           </Accordion.Item>
         ))}
       </Accordion.Root>
-      <div className={clsx('mt-6')} data-testid="standalone-gateways-container">
-        {gateways.length > 0 &&
-          gateways.map((gateway) => (
+      {gateways.length > 0 && (
+        <div className="mt-2" data-testid="standalone-gateways-container">
+          <h3 className="text-iron dark:text-bombay px-4 py-6 truncate">
+            {t('search-other-nodes')}
+          </h3>
+          {gateways.map((gateway) => (
             <motion.div
               key={gateway.id}
               initial={{ opacity: 0, translateX: -4 }}
@@ -216,18 +252,35 @@ function NodeList({
               data-testid={`standalone-gateway-${gateway.id.substring(0, 8)}`}
             >
               <GatewayItem
-                node={node}
+                node={hop}
                 gateway={gateway}
                 onSelect={onSelect}
                 vpnMode={vpnMode}
                 onNodeDetails={onNodeDetails}
                 quicLabel={quicFilter}
+                inSearchResult
               />
             </motion.div>
           ))}
-      </div>
+        </div>
+      )}
     </>
   );
-}
+}, arePropsEqual);
 
 export default NodeList;
+
+function arePropsEqual(
+  oldProps: NodeListProps,
+  newProps: NodeListProps,
+): boolean {
+  if (oldProps.hop !== newProps.hop) return false;
+  if (oldProps.vpnMode !== newProps.vpnMode) return false;
+  if (oldProps.gateways.length !== newProps.gateways.length) return false;
+  if (oldProps.nodes.length !== newProps.nodes.length) return false;
+  if (!dequal(oldProps.expanded, newProps.expanded)) return false;
+  if (!dequal(oldProps.focused, newProps.focused)) return false;
+  if (!dequal(oldProps.gateways, newProps.gateways)) return false;
+  if (!dequal(oldProps.nodes, newProps.nodes)) return false;
+  return true;
+}

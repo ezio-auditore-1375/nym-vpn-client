@@ -77,7 +77,8 @@ export type DbKey =
   | 'cache-mx-exit-gateways'
   | 'cache-wg-gateways'
   | 'cache-account-id'
-  | 'cache-device-id';
+  | 'cache-device-id'
+  | 'streaming-optimized-label-seen';
 
 export type DisplayServer = 'x11' | 'wayland' | 'unknown';
 
@@ -138,10 +139,19 @@ export type Gateway = {
   quic: boolean;
 };
 
+export type GatewayNode = {
+  id: string;
+  name: string;
+  country: Country;
+  region: string;
+  city: string;
+};
+
 export type GatewayType = 'mx-entry' | 'mx-exit' | 'wg';
 
 export type GatewaysByCountry = {
   country: Country;
+  regions: Array<Region>;
   gateways: Array<Gateway>;
   type: GatewayType;
   quic: boolean;
@@ -197,8 +207,6 @@ export type NetworkCompat = { core: boolean | null; tauri: boolean | null };
 
 export type NetworkEnv = 'mainnet' | 'canary' | 'qa' | 'sandbox';
 
-export type NodeConnect = Country | Gateway;
-
 export type OsInfo = {
   /**
    * long version
@@ -221,7 +229,22 @@ export type Performance = {
   uptime24h: number;
 };
 
+export type Region = {
+  name: string;
+  country: Country;
+  gateways: Array<Gateway>;
+  type: GatewayType;
+  quic: boolean;
+};
+
+export type RegionNode = { name: string; country: Country };
+
 export type Score = 'offline' | 'low' | 'medium' | 'high';
+
+export type SelectedNode =
+  | { type: 'country'; node: Country }
+  | { type: 'gateway'; node: GatewayNode }
+  | { type: 'region'; node: RegionNode };
 
 export type StartupError = {
   key: 'internal' | 'db-open' | 'db-locked';

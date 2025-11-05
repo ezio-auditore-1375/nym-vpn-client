@@ -1,10 +1,9 @@
 use crate::{
-    DEFAULT_QUIC,
     db::{Db, Key},
     error::{BackendError, ErrorKey},
     events::AppHandleEventEmitter,
     grpc::{
-        client::{GrpcClient, NodeConnect, VpndError},
+        client::{GrpcClient, Node, VpndError},
         tunnel::{ConnectingState, TunnelState},
     },
     state::{SharedAppState, app::VpnMode},
@@ -29,8 +28,9 @@ pub async fn connect(
     state: State<'_, SharedAppState>,
     grpc: State<'_, GrpcClient>,
     db: State<'_, Db>,
-    entry: NodeConnect,
-    exit: NodeConnect,
+    entry: Node,
+    exit: Node,
+    quic: bool,
 ) -> Result<TunnelState, BackendError> {
     {
         let mut app_state = state.lock().await;
@@ -78,10 +78,6 @@ pub async fn connect(
         .get_typed::<bool>(Key::DisableIpv6.as_ref())
         .unwrap_or(None)
         .unwrap_or(false);
-    let enable_quic = db
-        .get_typed::<bool>(Key::QuicEnabled.as_ref())
-        .unwrap_or(None)
-        .unwrap_or(DEFAULT_QUIC);
 
     match grpc
         .vpn_connect(
@@ -92,7 +88,7 @@ pub async fn connect(
             use_netstack_wireguard,
             dns,
             disable_ipv6,
-            enable_quic,
+            quic,
         )
         .await
     {

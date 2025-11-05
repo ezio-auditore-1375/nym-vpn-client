@@ -30,6 +30,11 @@ public struct GatewayCell: View {
         && appSettings.isQuicEnabled
     }
 
+    private var shouldShowStreaming: Bool {
+        hopType == .exit
+        && server.isResidentialAvailable
+    }
+
     public init(
         server: GatewayNode,
         type: HopType,
@@ -57,6 +62,8 @@ public struct GatewayCell: View {
                 .frame(width: 16)
             if shouldShowQuic {
                 QuicLabel()
+            } else if shouldShowStreaming {
+                StreamingIcon()
             } else {
                 lineSeparator()
             }
@@ -153,7 +160,7 @@ private extension GatewayCell {
            let country = gatewayManager.localizedCountry(with: countryCode) {
             "\(country.name), \(server.id)"
         } else {
-            server.id
+            server.location?.city ?? server.id
         }
     }
 

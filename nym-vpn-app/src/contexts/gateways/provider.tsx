@@ -8,14 +8,14 @@ import {
 } from '../../types';
 import { useMainDispatch, useMainState } from '../main';
 import { CCache } from '../../cache';
-import { DefaultCountry, GatewaysCacheDuration } from '../../constants';
+import { DefaultNode, GatewaysCacheDuration } from '../../constants';
 import { kvSet } from '../../kvStore';
 import { exists, getStateProps, gwTypeToCacheKey } from './util';
 import { GatewaysContext, initialState } from './context';
 import { reducer } from './reducer';
 import { GatewaysState } from './types';
 
-let initialized = false;
+let init = false;
 
 type GatewaysStateProviderProps = {
   children: React.ReactNode;
@@ -24,7 +24,8 @@ type GatewaysStateProviderProps = {
 function GatewaysProvider({ children }: GatewaysStateProviderProps) {
   const [state, dispatch] = useReducer(reducer, initialState);
 
-  const { entryNode, exitNode, daemonStatus, vpnMode } = useMainState();
+  const { initialized, entryNode, exitNode, daemonStatus, vpnMode } =
+    useMainState();
   const mainDispatch = useMainDispatch() as StateDispatch;
 
   const checkSelectedNode = useCallback(
@@ -36,10 +37,10 @@ function GatewaysProvider({ children }: GatewaysStateProviderProps) {
           type: 'set-node',
           payload: {
             hop: nodeType,
-            node: DefaultCountry,
+            node: DefaultNode,
           },
         });
-        await kvSet(`${nodeType}-node`, DefaultCountry);
+        await kvSet(`${nodeType}-node`, DefaultNode);
         // TODO notify user
       }
     },
@@ -129,7 +130,9 @@ function GatewaysProvider({ children }: GatewaysStateProviderProps) {
     countryCode: string,
     gateways: GatewaysByCountry[],
   ) => {
-    const byCountry = gateways.find((c) => c.country.code === countryCode);
+    const byCountry = gateways.find(
+      (c) => c.country.code.toLowerCase() === countryCode.toLowerCase(),
+    );
     if (byCountry) {
       return byCountry.gateways.find((gw) => gw.id === id) || null;
     }
@@ -151,10 +154,10 @@ function GatewaysProvider({ children }: GatewaysStateProviderProps) {
 
   // init gateways on app start
   useEffect(() => {
-    if (initialized || daemonStatus === 'down') {
+    if (!initialized || init || daemonStatus === 'down') {
       return;
     }
-    initialized = true;
+    init = true;
     if (vpnMode === 'wg') {
       fetchGateways('wg').then(() => {
         console.info('[wg] gateways initialized');
@@ -167,7 +170,7 @@ function GatewaysProvider({ children }: GatewaysStateProviderProps) {
         console.info('[mx-exit] gateways initialized');
       });
     }
-  }, [fetchGateways, daemonStatus, vpnMode]);
+  }, [initialized, fetchGateways, daemonStatus, vpnMode]);
 
   const ctx = useMemo<GatewaysState>(
     () => ({

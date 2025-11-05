@@ -27,7 +27,7 @@ import {
   SupportServerLocationUrl,
 } from '../../../constants';
 import { kvSet } from '../../../kvStore';
-import { uiNodeToRaw } from '../../../contexts/node-list/util';
+import { uiNodeToSelectedNode } from '../../../contexts/node-list/util';
 import { routes } from '../../../router';
 import DataCard from './DataCard';
 
@@ -49,7 +49,14 @@ function NodeDetails() {
   const { reset: resetSaved } = useNodeListState();
 
   const { gateway, hop } = location.state;
-  const { country, exitIpv4, exitIpv6, asn, buildVersion } = gateway;
+  const {
+    country,
+    exitIpv4,
+    exitIpv6,
+    asn,
+    buildVersion,
+    location: gwLocation,
+  } = gateway;
   const isGoodIp = asn?.type === 'residential';
   const serverLoad = gateway?.wgPerformance?.load;
   const uptime = gateway?.wgPerformance?.uptime24h;
@@ -143,13 +150,11 @@ function NodeDetails() {
     if (isSelected) {
       return;
     }
-    await kvSet(
-      hop === 'entry' ? 'entry-node' : 'exit-node',
-      uiNodeToRaw(gateway),
-    );
+    const selectedNode = uiNodeToSelectedNode(gateway);
+    await kvSet(hop === 'entry' ? 'entry-node' : 'exit-node', selectedNode);
     dispatch({
       type: 'set-node',
-      payload: { hop, node: gateway },
+      payload: { hop, node: selectedNode },
     });
     navigate(routes.root);
     resetSaved(hop);
@@ -269,9 +274,9 @@ function NodeDetails() {
   const Card1Footer = (
     <p className="text-iron dark:text-bombay">
       <Trans i18nKey="node-details.notes.anti-censorship" ns="nodeLocation">
-        <span className="text-black dark:text-white underline">
+        <Link className="text-black dark:text-white" to={routes.antiCensorship}>
           Enable “QUIC protocol”
-        </span>
+        </Link>
         in Anti-censorship Settings to use this feature
       </Trans>
     </p>
@@ -282,6 +287,18 @@ function NodeDetails() {
         relativeTime: dayjs().to(dayjs(lastUpdate)),
       })
     : t('node-details.notes.performance');
+
+  const serverLocation = () => {
+    const components = [];
+    if (gwLocation.city.length > 0) {
+      components.push(gwLocation.city);
+    }
+    if (gwLocation.region.length > 0) {
+      components.push(gwLocation.region);
+    }
+    components.push(getCountryName(country.code) || country.name);
+    return components.join(', ');
+  };
 
   return (
     <PageAnim className="xs:max-w-lg h-full flex flex-col mt-2 gap-6 cursor-default">
@@ -295,7 +312,7 @@ function NodeDetails() {
           className="h-6"
         />
         <div className="text-lg" data-testid="node-details-country-name">
-          {getCountryName(country.code) || country.name}
+          {serverLocation()}
         </div>
       </div>
       {gateway.description && (

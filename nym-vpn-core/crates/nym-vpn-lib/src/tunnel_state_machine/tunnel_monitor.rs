@@ -3,9 +3,10 @@
 
 use futures::{FutureExt, future::Fuse, pin_mut};
 
+use nym_authenticator_client::AuthClientMixnetListenerHandle;
 use nym_connection_monitor::{
     ConnectionEvent, ConnectionMonitor, ConnectionStatusEvent, IcmpProbe, IcmpProbeConfig,
-    TimingConfig,
+    TcpProbe, TcpProbeConfig, TimingConfig,
 };
 use nym_registration_client::{
     MixnetRegistrationResult, RegistrationClientBuilder, RegistrationClientBuilderConfig,
@@ -13,8 +14,7 @@ use nym_registration_client::{
 };
 use nym_registration_common::NymNode;
 use nym_sdk::UserAgent;
-use nym_vpn_account_controller::AccountStateReceiver;
-use nym_vpn_network_config::{Network, start_background_file_refresh};
+use nym_vpn_account_controller::{AccountCommandSender, AccountStateReceiver};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(any(target_os = "linux", target_os = "ios", target_os = "android"))]
@@ -57,10 +57,11 @@ use super::{
     Error, NymConfig, Result, TunnelInterface, TunnelMetadata, TunnelSettings,
     tunnel::{self, AnyTunnelHandle, SelectedGateways, Tombstone},
 };
-use nym_common::trace_err_chain;
+use nym_common::{ErrorExt, trace_err_chain};
 use nym_vpn_lib_types::{
-    ConnectionData, ErrorStateReason, EstablishConnectionData, GatewayId, MixnetConnectionData,
-    NymAddress, TunnelConnectionData, TunnelType, WireguardConnectionData, WireguardNode,
+    AccountControllerError, BridgeAddress, ConnectionData, ErrorStateReason,
+    EstablishConnectionData, GatewayId, MixnetConnectionData, NymAddress, TunnelConnectionData,
+    TunnelType, WireguardConnectionData, WireguardNode,
 };
 use nym_vpn_store::keys::wireguard::WireguardKeysDb;
 
@@ -71,17 +72,17 @@ use super::tunnel::wireguard::connected_tunnel::{NetstackTunnelOptions, TunnelOp
 use crate::tunnel_provider::AndroidTunProvider;
 #[cfg(target_os = "ios")]
 use crate::tunnel_provider::OSTunProvider;
-#[cfg(not(target_os = "linux"))]
-use crate::tunnel_state_machine::tunnel::transports::TransportError;
 use crate::{
-    VpnTopologyProvider,
+    DEFAULT_MIN_GATEWAY_PERFORMANCE, DEFAULT_MIN_MIXNODE_PERFORMANCE, VpnTopologyProvider,
     bandwidth_controller::BandwidthController,
     tunnel_state_machine::{
         TunnelConstants, WireguardMultihopMode, account, ipv6_availability,
         tunnel::{
-            mixnet, transports,
+            mixnet,
+            transports::{self, TransportError},
             wireguard::{
                 self, ConnectionData as WgConnectionData, MetadataEvent, MetadataReceiver,
+                connected_tunnel::ConnectedTunnel,
             },
         },
     },
@@ -126,6 +127,9 @@ pub type TunnelMonitorEventReceiver = mpsc::UnboundedReceiver<TunnelMonitorEvent
 
 /// Timeout when waiting for reply from the event handler.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for starting the registration client
+const REGISTRATION_CLIENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 pub enum TunnelMonitorEvent {
@@ -182,12 +186,6 @@ pub enum TunnelMonitorEvent {
         /// Back channel to acknowledge that the event has been processed
         reply_tx: tokio::sync::oneshot::Sender<()>,
     },
-
-    /// A new network environment was discovered
-    NewNetworkEnv {
-        /// The new network environment
-        network: Box<Network>,
-    },
 }
 
 pub struct TunnelMonitorHandle {
@@ -230,6 +228,7 @@ pub struct TunnelMonitor {
     #[cfg(target_os = "android")]
     tun_provider: Arc<dyn AndroidTunProvider>,
     account_controller_state: AccountStateReceiver,
+    account_command_tx: AccountCommandSender,
     gateway_cache_handle: GatewayCacheHandle,
     custom_topology_provider: VpnTopologyProvider,
     wg_keys_db: WireguardKeysDb,
@@ -237,9 +236,11 @@ pub struct TunnelMonitor {
 }
 
 impl TunnelMonitor {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         tunnel_parameters: TunnelParameters,
         account_controller_state: AccountStateReceiver,
+        account_command_tx: AccountCommandSender,
         gateway_cache_handle: GatewayCacheHandle,
         custom_topology_provider: VpnTopologyProvider,
         monitor_event_sender: mpsc::UnboundedSender<TunnelMonitorEvent>,
@@ -257,6 +258,7 @@ impl TunnelMonitor {
             #[cfg(any(target_os = "ios", target_os = "android"))]
             tun_provider,
             account_controller_state,
+            account_command_tx,
             gateway_cache_handle,
             custom_topology_provider,
             wg_keys_db,
@@ -298,10 +300,27 @@ impl TunnelMonitor {
 
         self.send_event(TunnelMonitorEvent::AwaitingAccountReadiness);
 
-        self.account_controller_state
+        match self
+            .account_controller_state
             .wait_for_account_ready_to_connect()
             .await
-            .map_err(|e| Error::Account(account::Error::ControllerState(e)))?;
+        {
+            Ok(()) => Ok(()),
+            Err(AccountControllerError::ErrorState(reason)) if reason.is_retryable() => {
+                tracing::debug!(
+                    "Account controller is in a retryable error state : {reason}. Forcing a refresh"
+                );
+                self.account_command_tx
+                    .background_refresh_account_state()
+                    .await
+                    .map_err(|e| Error::Account(account::Error::Command(e)))?;
+                self.account_controller_state
+                    .wait_for_account_ready_to_connect()
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+        .map_err(|e| Error::Account(account::Error::ControllerState(e)))?;
 
         self.send_event(TunnelMonitorEvent::RefreshingGateways);
 
@@ -427,13 +446,45 @@ impl TunnelMonitor {
             .mixnet_client_config
             .clone()
             .unwrap_or_default();
+
+        tracing::debug!(
+            "Mixnet client performance thresholds: min_mixnode={:?}, min_gateway={:?}",
+            mixnet_client_config.min_mixnode_performance,
+            mixnet_client_config.min_gateway_performance
+        );
+
         let custom_topology_provider = self.custom_topology_provider.clone();
         custom_topology_provider
             .update_config(
-                mixnet_client_config.min_mixnode_performance,
-                mixnet_client_config.min_gateway_performance,
+                mixnet_client_config
+                    .min_mixnode_performance
+                    .unwrap_or(DEFAULT_MIN_MIXNODE_PERFORMANCE),
+                mixnet_client_config
+                    .min_gateway_performance
+                    .unwrap_or(DEFAULT_MIN_GATEWAY_PERFORMANCE),
+                Some(
+                    self.tunnel_parameters
+                        .resolved_gateway_config
+                        .nym_api_resolver_overrides
+                        .clone(),
+                ),
             )
             .await;
+
+        tracing::debug!(
+            "Connecting to entry gateway: {}",
+            selected_gateways
+                .entry_gateway()
+                .identity()
+                .to_base58_string()
+        );
+        tracing::debug!(
+            "Connecting to exit gateway: {}",
+            selected_gateways
+                .exit_gateway()
+                .identity()
+                .to_base58_string()
+        );
 
         let entry_ip = selected_gateways
             .entry_gateway()
@@ -488,25 +539,30 @@ impl TunnelMonitor {
             keys: selected_gateways.exit_keypair().clone(),
         };
 
-        let rc_builder_config = RegistrationClientBuilderConfig {
-            entry_node,
-            exit_node,
-            data_path: self.tunnel_parameters.nym_config.data_path.clone(),
-            mixnet_client_config,
-            two_hops: self.tunnel_parameters.tunnel_settings.tunnel_type == TunnelType::Wireguard,
-            user_agent,
-            custom_topology_provider: Box::new(self.custom_topology_provider.clone()),
-            network_env: self
-                .tunnel_parameters
-                .nym_config
-                .network_env
-                .nym_network
-                .network
-                .clone(),
-            cancel_token: self.shutdown_token.child_token(),
-            #[cfg(unix)]
-            connection_fd_callback: Arc::new(connection_fd_callback),
-        };
+        let network_env = self
+            .tunnel_parameters
+            .nym_config
+            .network_rx
+            .borrow()
+            .clone();
+        let nym_network = network_env.nym_network.network.clone();
+        let rcb_config_builder = RegistrationClientBuilderConfig::builder()
+            .entry_node(entry_node)
+            .exit_node(exit_node)
+            .data_path(self.tunnel_parameters.nym_config.data_path.clone())
+            .mixnet_client_config(mixnet_client_config)
+            .mixnet_client_startup_timeout(REGISTRATION_CLIENT_STARTUP_TIMEOUT)
+            .two_hops(self.tunnel_parameters.tunnel_settings.tunnel_type == TunnelType::Wireguard)
+            .user_agent(user_agent)
+            .custom_topology_provider(Box::new(self.custom_topology_provider.clone()))
+            .network_env(nym_network)
+            .cancel_token(self.shutdown_token.child_token());
+
+        #[cfg(unix)]
+        let rcb_config_builder =
+            rcb_config_builder.connection_fd_callback(Arc::new(connection_fd_callback));
+
+        let rc_builder_config = rcb_config_builder.build();
 
         // Setup shutdown guard to cancel pending tasks that otherwise may continue running upon return
         let shutdown_guard = self.shutdown_token.clone().drop_guard();
@@ -560,26 +616,61 @@ impl TunnelMonitor {
         let (exit_metadata_tx, exit_metadata_rx) = tokio::sync::oneshot::channel::<MetadataEvent>();
 
         let (entry_metadata_addr_tx, entry_metadata_addr_rx) = tokio::sync::oneshot::channel();
+        let (bridge_close_tx, mut bridge_close_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let StartTunnelResult {
-            tunnel_interface,
-            tunnel_conn_data,
-            mut tunnel_handle,
-        } = match registration_result {
+        // todo: refactor
+        let (
+            StartTunnelResult {
+                tunnel_interface,
+                tunnel_conn_data,
+                mut tunnel_handle,
+            },
+            wg_tunnel_runtime,
+            mixnet_client_token,
+            _bridge_close_tx,
+        ) = match registration_result {
             RegistrationResult::Mixnet(inner_result) => {
-                self.start_mixnet_tunnel(*inner_result).await?
+                let mixnet_client_token = inner_result.mixnet_client.cancellation_token();
+
+                (
+                    self.start_mixnet_tunnel(*inner_result).await?,
+                    None,
+                    Some(mixnet_client_token),
+                    // Return sender back to avoid it being dropped
+                    Some(bridge_close_tx),
+                )
             }
             RegistrationResult::Wireguard(inner_result) => {
-                let connected_tunnel = self
+                let (mut connection_data, mut wg_tunnel_runtime) = self
                     .setup_wireguard_tunnel(
                         *inner_result,
                         entry_metadata_rx,
                         exit_metadata_rx,
-                        selected_gateways.clone(),
+                        &selected_gateways,
                     )
                     .await?;
 
-                match self
+                let bridge_close_tx = if self.tunnel_parameters.tunnel_settings.bridges_enabled() {
+                    let (entry_bridge_addr, transport_fwd_handle) = self
+                        .start_bridges(&selected_gateways, bridge_close_tx)
+                        .await?;
+
+                    wg_tunnel_runtime.transport_fwd_handle = Some(transport_fwd_handle);
+                    connection_data.entry_bridge_addr = Some(entry_bridge_addr);
+
+                    None
+                } else {
+                    // Return bridge_close_tx back to avoid it being dropped
+                    Some(bridge_close_tx)
+                };
+
+                let connected_tunnel = ConnectedTunnel::new(
+                    selected_gateways.entry_keypair().clone(),
+                    selected_gateways.exit_keypair().clone(),
+                    connection_data,
+                );
+
+                let start_tunnel_result = match self
                     .tunnel_parameters
                     .tunnel_settings
                     .wireguard_tunnel_options
@@ -596,7 +687,16 @@ impl TunnelMonitor {
                         )
                         .await?
                     }
-                }
+                };
+
+                let mixnet_client_token = wg_tunnel_runtime.mixnet_client_token();
+
+                (
+                    start_tunnel_result,
+                    Some(wg_tunnel_runtime),
+                    mixnet_client_token,
+                    bridge_close_tx,
+                )
             }
         };
 
@@ -616,22 +716,6 @@ impl TunnelMonitor {
         if tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await.is_err() {
             tracing::warn!("Interface up reply timeout");
         }
-
-        // todo: move discovery refresher closer to VpnService
-        let (discovery_refresher_tx, mut discovery_refresher_rx) = tokio::sync::mpsc::channel(1);
-        let discovery_refresher_handle = if let Some(config_path) =
-            self.tunnel_parameters.nym_config.config_path.as_ref()
-            && let Some(config_dir) = config_path.parent()
-        {
-            Some(start_background_file_refresh(
-                config_dir.to_path_buf(),
-                self.tunnel_parameters.nym_config.network_env.clone(),
-                discovery_refresher_tx.clone(),
-                self.shutdown_token.child_token(),
-            ))
-        } else {
-            None
-        };
 
         // Send metadata endpoint data to the bandwidth controller
         match &tunnel_interface {
@@ -660,8 +744,7 @@ impl TunnelMonitor {
             }
         }
 
-        let mixnet_monitoring_token = tunnel_handle
-            .mixnet_client_token()
+        let mixnet_monitoring_token = mixnet_client_token
             .map(|token| token.cancelled_owned().fuse())
             .unwrap_or(Fuse::terminated());
         pin_mut!(mixnet_monitoring_token);
@@ -715,6 +798,14 @@ impl TunnelMonitor {
                         }
                     }
                 }
+                close_event = bridge_close_rx.recv() => {
+                    if close_event.is_some() {
+                        tracing::info!("Bridge close signal received. Exiting");
+                    } else {
+                        tracing::info!("Bridge channel is closed. Exiting");
+                    }
+                    break;
+                }
                 _  = &mut mixnet_monitoring_token => {
                     tracing::error!("MixnetClient exited unexpectedly");
                     break;
@@ -722,26 +813,30 @@ impl TunnelMonitor {
                 _ = self.shutdown_token.cancelled() => {
                     break;
                 }
-                ret = discovery_refresher_rx.recv() => {
-                    match ret {
-                        Some(Ok(network)) => {
-                            tracing::info!("Refreshed discovery file");
-                            self.send_event(TunnelMonitorEvent::NewNetworkEnv { network: Box::new(network) });
-                        }
-                        Some(Err(err)) => {
-                            trace_err_chain!(err, "Failed to refresh discovery file");
-                        }
-                        None => {
-                            tracing::info!("Discovery refresh channel is closed");
-                            break;
-                        }
-                    }
-                }
             }
         }
 
         // Trigger cancellation since many other tasks depend on shutdown token
         drop(shutdown_guard);
+
+        // Shutdown WireGuard tunnel runtime
+        if let Some(wg_tunnel_runtime) = wg_tunnel_runtime {
+            if let Err(err) = wg_tunnel_runtime.bandwidth_controller_handle.await {
+                tracing::error!("Failed to await bandwidth controller handle: {}", err);
+            }
+
+            if let Some(transport_fwd_handle) = wg_tunnel_runtime.transport_fwd_handle
+                && let Err(err) = transport_fwd_handle.await
+            {
+                tracing::error!("Failed to await transport forward handle: {}", err);
+            }
+
+            if let Some(authenticator_listener_handle) =
+                wg_tunnel_runtime.authenticator_listener_handle
+            {
+                authenticator_listener_handle.stop().await;
+            }
+        }
 
         if let Err(e) = tunnel_connection_monitor_handle.await {
             tracing::error!("Tunnel connection monitor exited with error: {}", e);
@@ -758,12 +853,6 @@ impl TunnelMonitor {
             })
             .unwrap_or_default();
 
-        if let Some(discovery_refresher_handle) = discovery_refresher_handle {
-            tracing::debug!("Wait for discovery refresher to exit");
-            if let Err(e) = discovery_refresher_handle.await {
-                tracing::error!("Failed to join on discovery refresher: {}", e);
-            }
-        }
         tracing::info!("Tunnel monitor finished");
 
         Ok(tun_devices)
@@ -817,7 +906,8 @@ impl TunnelMonitor {
             self.enable_ipv6()
                 .then_some(assigned_addresses.interface_addresses.ipv6),
             mtu,
-        )?;
+        )
+        .await?;
 
         #[cfg(any(target_os = "ios", target_os = "android"))]
         let tun_device = {
@@ -899,7 +989,7 @@ impl TunnelMonitor {
             registration_result.mixnet_client,
             assigned_addresses,
             tun_device,
-            self.shutdown_token.clone(),
+            self.shutdown_token.child_token(),
             registration_result.event_rx,
         )
         .await
@@ -917,8 +1007,8 @@ impl TunnelMonitor {
         registration_result: WireguardRegistrationResult,
         entry_metadata_rx: MetadataReceiver,
         exit_metadata_rx: MetadataReceiver,
-        selected_gateways: SelectedGateways,
-    ) -> Result<wireguard::connected_tunnel::ConnectedTunnel> {
+        selected_gateways: &SelectedGateways,
+    ) -> Result<(WgConnectionData, WgTunnelRuntime)> {
         let (entry_signal_tx, entry_signal_rx) = tokio::sync::oneshot::channel();
         let (exit_signal_tx, exit_signal_rx) = tokio::sync::oneshot::channel();
 
@@ -940,20 +1030,24 @@ impl TunnelMonitor {
             bw_controller,
         } = registration_result;
 
+        let gw_update_version = self
+            .tunnel_parameters
+            .nym_config
+            .network_rx
+            .borrow()
+            .gw_update_version();
+
         let bw = BandwidthController::create(
             bw_controller,
-            &selected_gateways,
+            selected_gateways,
             entry_gateway_client,
             exit_gateway_client,
             entry_gateway_data.clone(),
             exit_gateway_data.clone(),
             entry_signal_rx,
             exit_signal_rx,
-            self.tunnel_parameters
-                .nym_config
-                .network_env
-                .gw_update_version(),
-            self.shutdown_token.clone(),
+            gw_update_version,
+            self.shutdown_token.child_token(),
         )
         .await
         .map_err(|e| Box::new(tunnel::Error::from(e)))?;
@@ -970,53 +1064,83 @@ impl TunnelMonitor {
         };
         let bandwidth_controller_handle = tokio::spawn(bw.run());
 
-        let mut connection_data = WgConnectionData {
+        let rt = WgTunnelRuntime {
+            bandwidth_controller_handle,
+            transport_fwd_handle: None,
+            authenticator_listener_handle,
+        };
+
+        let connection_data = WgConnectionData {
             entry_bridge_addr: None,
             entry: entry_gateway_data,
             exit: exit_gateway_data,
         };
 
-        let transport_fwd_handle = if self.tunnel_parameters.tunnel_settings.bridges_enabled() {
-            let entry_bridge_params = selected_gateways
-                .entry_gateway()
-                .get_bridge_params()
-                .ok_or(transports::TransportError::config_err(
-                    "attempted to open transport connection without bridge params",
-                ))?;
+        Ok((connection_data, rt))
+    }
 
-            // Attempt transport Connection. If successful a listening UDP connection is created
-            // and the bind address of that UDP listener is provided to the entry wireguard tunnel
-            // as the endpoint address.
-            tracing::info!("Establishing DVPN QUIC transport tunnel");
+    async fn start_bridges(
+        &self,
+        selected_gateways: &SelectedGateways,
+        bridge_close_tx: mpsc::UnboundedSender<()>,
+    ) -> Result<(BridgeAddress, JoinHandle<()>)> {
+        let entry_bridge_params = selected_gateways
+            .entry_gateway()
+            .get_bridge_params()
+            .ok_or(TransportError::config_err(
+                "attempted to open transport connection without bridge params",
+            ))?;
 
-            let bridge_conn = transports::BridgeConn::try_connect(
-                entry_bridge_params,
-                self.shutdown_token.clone(),
-            )
-            .await
-            .inspect_err(|_| self.shutdown_token.cancel())?;
-            connection_data.entry_bridge_addr = Some(bridge_conn.endpoint);
-            let (local_fwd_listen_addr, fwd_handle) =
-                transports::UdpForwarder::launch(bridge_conn, None, self.shutdown_token.clone())
-                    .await
-                    .inspect_err(|_| self.shutdown_token.cancel())?;
-            tracing::info!(
-                "quic transport connected, udp forwarder open on {local_fwd_listen_addr:?}"
-            );
-            connection_data.entry.endpoint = local_fwd_listen_addr;
-            Some(fwd_handle)
-        } else {
-            None
+        // Attempt transport Connection. If successful a listening UDP connection is created
+        // and the bind address of that UDP listener is provided to the entry wireguard tunnel
+        // as the endpoint address.
+        tracing::info!("Establishing DVPN QUIC transport tunnel");
+
+        #[cfg(target_os = "linux")]
+        let fwmark = self.tunnel_parameters.tunnel_constants.fwmark;
+        #[cfg(target_os = "android")]
+        let tun_provider = self.tun_provider.clone();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let on_quic_socket_open = move |fd| {
+            #[cfg(target_os = "android")]
+            {
+                tracing::debug!("Bypass quic socket");
+                tun_provider.bypass(fd);
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                tracing::debug!("Bypass quic socket");
+                let borrowed_fd = unsafe { &BorrowedFd::borrow_raw(fd) };
+                if let Err(err) = Mark.set(borrowed_fd, &fwmark) {
+                    tracing::error!("Could not set fwmark for quic socket fd: {err}");
+                }
+            }
+        };
+        let bridge_conn = transports::BridgeConn::try_connect(
+            entry_bridge_params,
+            self.shutdown_token.child_token(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            on_quic_socket_open,
+        )
+        .await?;
+        let remote_addr = bridge_conn.endpoint;
+        let (listen_addr, join_handle) = transports::UdpForwarder::launch(
+            bridge_conn,
+            None,
+            bridge_close_tx,
+            self.shutdown_token.child_token(),
+        )
+        .await?;
+
+        tracing::info!("quic transport connected, udp forwarder open on {listen_addr}");
+
+        let bridge_addr = BridgeAddress {
+            listen_addr,
+            remote_addr,
         };
 
-        Ok(wireguard::connected_tunnel::ConnectedTunnel::new(
-            selected_gateways.entry_keypair().clone(),
-            selected_gateways.exit_keypair().clone(),
-            connection_data,
-            bandwidth_controller_handle,
-            transport_fwd_handle,
-            authenticator_listener_handle,
-        ))
+        Ok((bridge_addr, join_handle))
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1040,13 +1164,7 @@ impl TunnelMonitor {
         tracing::info!("Created exit tun device: {}", exit_tun_name);
 
         #[cfg(not(target_os = "linux"))]
-        let entry_endpoint = if use_bridges {
-            conn_data.entry_bridge_addr.ok_or(TransportError::other(
-                "missing bridge address after connect", // this should not be possible
-            ))?
-        } else {
-            conn_data.entry.endpoint
-        };
+        let entry_endpoint = conn_data.effective_remote_entry_endpoint();
 
         let routing_config = RoutingConfig::WireguardNetstack {
             exit_tun_name: exit_tun_name.clone(),
@@ -1058,7 +1176,7 @@ impl TunnelMonitor {
         self.set_routes(routing_config, self.enable_ipv6()).await?;
 
         let tunnel_conn_data = TunnelConnectionData::Wireguard(WireguardConnectionData {
-            entry_bridge_addr: conn_data.entry_bridge_addr,
+            entry_bridge_addr: conn_data.entry_bridge_addr.clone(),
             entry: WireguardNode::from(conn_data.entry.clone()),
             exit: WireguardNode::from(conn_data.exit.clone()),
         });
@@ -1133,19 +1251,13 @@ impl TunnelMonitor {
         };
 
         let tunnel_conn_data = TunnelConnectionData::Wireguard(WireguardConnectionData {
-            entry_bridge_addr: conn_data.entry_bridge_addr,
+            entry_bridge_addr: conn_data.entry_bridge_addr.clone(),
             entry: WireguardNode::from(conn_data.entry.clone()),
             exit: WireguardNode::from(conn_data.exit.clone()),
         });
 
         #[cfg(not(target_os = "linux"))]
-        let entry_endpoint = if use_bridges {
-            conn_data.entry_bridge_addr.ok_or(TransportError::other(
-                "missing bridge address after connect", // this should not be possible
-            ))?
-        } else {
-            conn_data.entry.endpoint
-        };
+        let entry_endpoint = conn_data.effective_remote_entry_endpoint();
 
         let dns_config = self.tunnel_parameters.tunnel_settings.resolved_dns_config();
         let tunnel_options = TunnelOptions::Netstack(NetstackTunnelOptions {
@@ -1173,11 +1285,18 @@ impl TunnelMonitor {
         tracing::info!("Created wintun device: {}", wintun_exit_interface.name);
 
         wintun::setup_wintun_adapter(wintun_exit_interface.windows_luid(), exit_adapter_config)?;
+        wintun::wait_for_interfaces(
+            wintun_exit_interface.windows_luid(),
+            true,
+            self.enable_ipv6(),
+        )
+        .await?;
         wintun::initialize_interfaces(
             wintun_exit_interface.windows_luid(),
             Some(exit_mtu),
             self.enable_ipv6().then_some(exit_mtu),
         )?;
+        wintun::wait_for_addresses(wintun_exit_interface.windows_luid()).await?;
 
         let routing_config = RoutingConfig::WireguardNetstack {
             exit_tun_name: wintun_exit_interface.name.clone(),
@@ -1263,13 +1382,7 @@ impl TunnelMonitor {
         };
 
         #[cfg(not(target_os = "linux"))]
-        let entry_endpoint = if use_bridges {
-            conn_data.entry_bridge_addr.ok_or(TransportError::other(
-                "missing bridge address after connect", // this should not be possible
-            ))?
-        } else {
-            conn_data.entry.endpoint
-        };
+        let entry_endpoint = conn_data.effective_remote_entry_endpoint();
 
         let routing_config = RoutingConfig::Wireguard {
             entry_tun_name: entry_tunnel_metadata.interface.clone(),
@@ -1287,7 +1400,7 @@ impl TunnelMonitor {
         self.set_routes(routing_config, self.enable_ipv6()).await?;
 
         let tunnel_conn_data = TunnelConnectionData::Wireguard(WireguardConnectionData {
-            entry_bridge_addr: conn_data.entry_bridge_addr,
+            entry_bridge_addr: conn_data.entry_bridge_addr.clone(),
             entry: WireguardNode::from(conn_data.entry.clone()),
             exit: WireguardNode::from(conn_data.exit.clone()),
         });
@@ -1331,16 +1444,7 @@ impl TunnelMonitor {
         let exit_tun_mtu = connected_tunnel.exit_mtu();
 
         let exit_gateway_address = conn_data.exit.endpoint.ip();
-        let entry_gateway_address = if use_bridges {
-            conn_data
-                .entry_bridge_addr
-                .ok_or(TransportError::other(
-                    "missing bridge address after connect", // this should not be possible
-                ))?
-                .ip()
-        } else {
-            conn_data.entry.endpoint.ip()
-        };
+        let entry_gateway_address = conn_data.effective_remote_entry_endpoint().ip();
 
         let entry_adapter_config = WintunAdapterConfig {
             interface_ipv4: conn_data.entry.private_ipv4,
@@ -1378,7 +1482,7 @@ impl TunnelMonitor {
         };
 
         let tunnel_conn_data = TunnelConnectionData::Wireguard(WireguardConnectionData {
-            entry_bridge_addr: conn_data.entry_bridge_addr,
+            entry_bridge_addr: conn_data.entry_bridge_addr.clone(),
             entry: WireguardNode::from(conn_data.entry.clone()),
             exit: WireguardNode::from(conn_data.exit.clone()),
         });
@@ -1419,6 +1523,18 @@ impl TunnelMonitor {
         wintun::setup_wintun_adapter(wintun_entry_interface.windows_luid(), entry_adapter_config)?;
         wintun::setup_wintun_adapter(wintun_exit_interface.windows_luid(), exit_adapter_config)?;
 
+        wintun::wait_for_interfaces(
+            wintun_entry_interface.windows_luid(),
+            true,
+            self.enable_ipv6(),
+        )
+        .await?;
+        wintun::wait_for_interfaces(
+            wintun_exit_interface.windows_luid(),
+            true,
+            self.enable_ipv6(),
+        )
+        .await?;
         wintun::initialize_interfaces(
             wintun_entry_interface.windows_luid(),
             Some(entry_tun_mtu),
@@ -1429,6 +1545,8 @@ impl TunnelMonitor {
             Some(exit_tun_mtu),
             self.enable_ipv6().then_some(exit_tun_mtu),
         )?;
+        wintun::wait_for_addresses(wintun_entry_interface.windows_luid()).await?;
+        wintun::wait_for_addresses(wintun_exit_interface.windows_luid()).await?;
 
         // Update interface names in tunnel metadata
         entry_tunnel_metadata.interface = wintun_entry_interface.name.clone();
@@ -1484,16 +1602,7 @@ impl TunnelMonitor {
             )));
         }
 
-        let entry_endpoint = if use_bridges {
-            conn_data
-                .entry_bridge_addr
-                .ok_or(TransportError::other(
-                    "missing bridge address after connect", // this should not be possible
-                ))?
-                .ip()
-        } else {
-            conn_data.entry.endpoint.ip()
-        };
+        let entry_endpoint = conn_data.effective_remote_entry_endpoint().ip();
 
         let packet_tunnel_settings = crate::tunnel_provider::TunnelSettings {
             dns_servers: self
@@ -1524,7 +1633,7 @@ impl TunnelMonitor {
         tracing::info!("Created tun device: {}", tunnel_metadata.interface);
 
         let tunnel_conn_data = TunnelConnectionData::Wireguard(WireguardConnectionData {
-            entry_bridge_addr: conn_data.entry_bridge_addr,
+            entry_bridge_addr: conn_data.entry_bridge_addr.clone(),
             entry: WireguardNode::from(conn_data.entry.clone()),
             exit: WireguardNode::from(conn_data.exit.clone()),
         });
@@ -1570,25 +1679,27 @@ impl TunnelMonitor {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn create_mixnet_device(
+    async fn create_mixnet_device(
         interface_ipv4: Ipv4Addr,
         interface_ipv6: Option<Ipv6Addr>,
         mtu: u16,
     ) -> Result<AsyncDevice> {
-        let mut tun_config = tun::Configuration::default();
+        let tun_device = {
+            let mut tun_config = tun::Configuration::default();
 
-        // rust-tun uses the same name for tunnel type.
-        #[cfg(windows)]
-        tun_config.name(MIXNET_WINTUN_NAME);
+            // rust-tun uses the same name for tunnel type.
+            #[cfg(windows)]
+            tun_config.name(MIXNET_WINTUN_NAME);
 
-        tun_config.address(interface_ipv4).mtu(i32::from(mtu)).up();
+            tun_config.address(interface_ipv4).mtu(i32::from(mtu)).up();
 
-        #[cfg(target_os = "linux")]
-        tun_config.platform(|platform_config| {
-            platform_config.packet_information(false);
-        });
+            #[cfg(target_os = "linux")]
+            tun_config.platform(|platform_config| {
+                platform_config.packet_information(false);
+            });
 
-        let tun_device = tun::create_as_async(&tun_config).map_err(Error::CreateTunDevice)?;
+            tun::create_as_async(&tun_config).map_err(Error::CreateTunDevice)?
+        };
 
         let tun_name = tun_device
             .get_ref()
@@ -1609,11 +1720,13 @@ impl TunnelMonitor {
                 wintun::add_ipv6_address(interface_luid, interface_ipv6)?;
             }
 
+            wintun::wait_for_interfaces(interface_luid, true, interface_ipv6.is_some()).await?;
             wintun::initialize_interfaces(
                 interface_luid,
                 Some(mtu),
                 interface_ipv6.is_some().then_some(mtu),
             )?;
+            wintun::wait_for_addresses(interface_luid).await?;
         }
 
         Ok(tun_device)
@@ -1699,57 +1812,106 @@ impl TunnelMonitor {
         self.tunnel_parameters.tunnel_settings.enable_ipv6
     }
 
-    fn create_tunnel_connection_monitor(
-        &self,
-        exit_tunnel_metadata: &TunnelMetadata,
-        event_tx: mpsc::UnboundedSender<ConnectionEvent>,
-    ) -> Result<JoinHandle<Result<(), nym_connection_monitor::Error>>> {
+    fn create_icmp_probe(&self, exit_tunnel_metadata: &TunnelMetadata) -> Result<IcmpProbe> {
         let mut icmp_probe_config = IcmpProbeConfig::default_v4();
 
         // Prefer bind to interface on supported platforms
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "ios",
-            target_os = "macos"
-        ))]
+        #[cfg(any(target_os = "linux", target_os = "ios", target_os = "macos"))]
         {
             icmp_probe_config =
                 icmp_probe_config.with_interface(exit_tunnel_metadata.interface.clone());
         }
 
         // Bind to local interface IP on other platforms
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "ios",
-            target_os = "macos"
-        )))]
+        #[cfg(not(any(target_os = "linux", target_os = "ios", target_os = "macos")))]
         {
             let local_addr = exit_tunnel_metadata
                 .ips
                 .iter()
                 .find(|v| v.is_ipv4())
-                .ok_or(Error::IcmpProbeRequiresIPv4Addr)?;
+                .ok_or(Error::ProbeRequiresIPv4Addr)?;
             icmp_probe_config = icmp_probe_config.with_local_address(*local_addr);
         }
 
-        let icmp_probe = IcmpProbe::new(icmp_probe_config).map_err(Error::CreateIcmpProbe)?;
+        IcmpProbe::new(icmp_probe_config).map_err(Error::CreateIcmpProbe)
+    }
+
+    fn create_tcp_probe(&self, exit_tunnel_metadata: &TunnelMetadata) -> Result<TcpProbe> {
+        let mut tcp_probe_config = TcpProbeConfig::default_v4();
+
+        // Prefer bind to interface on supported platforms
+        #[cfg(any(target_os = "linux", target_os = "ios", target_os = "macos"))]
+        {
+            tcp_probe_config =
+                tcp_probe_config.with_interface(exit_tunnel_metadata.interface.clone());
+        }
+
+        // Bind to local interface IP on other platforms
+        #[cfg(not(any(target_os = "linux", target_os = "ios", target_os = "macos")))]
+        {
+            let local_addr = exit_tunnel_metadata
+                .ips
+                .iter()
+                .find(|v| v.is_ipv4())
+                .ok_or(Error::ProbeRequiresIPv4Addr)?;
+            tcp_probe_config = tcp_probe_config.with_local_address(SocketAddr::new(*local_addr, 0));
+        }
+
+        TcpProbe::new(tcp_probe_config).map_err(Error::CreateTcpProbe)
+    }
+
+    fn create_tunnel_connection_monitor(
+        &self,
+        exit_tunnel_metadata: &TunnelMetadata,
+        event_tx: mpsc::UnboundedSender<ConnectionEvent>,
+    ) -> Result<JoinHandle<Result<(), nym_connection_monitor::Error>>> {
         let timing_config = match self.tunnel_parameters.tunnel_settings.tunnel_type {
             TunnelType::Mixnet => TimingConfig::mixnet(),
             TunnelType::Wireguard => TimingConfig::two_hop(),
         };
-        Ok(ConnectionMonitor::spawn(
-            icmp_probe,
-            timing_config,
-            event_tx,
-            self.shutdown_token.child_token(),
-        ))
+
+        // Create ICMP probe first, fallback to TCP probe on failure
+        match self.create_icmp_probe(exit_tunnel_metadata) {
+            Ok(icmp_probe) => Ok(ConnectionMonitor::spawn(
+                icmp_probe,
+                timing_config,
+                event_tx,
+                self.shutdown_token.child_token(),
+            )),
+            Err(err) => {
+                tracing::warn!("{}", err.display_chain());
+                tracing::info!("Fallback to TCP probe");
+                let tcp_probe = self.create_tcp_probe(exit_tunnel_metadata)?;
+
+                Ok(ConnectionMonitor::spawn(
+                    tcp_probe,
+                    timing_config,
+                    event_tx,
+                    self.shutdown_token.child_token(),
+                ))
+            }
+        }
     }
 }
 
-pub struct StartTunnelResult {
+struct StartTunnelResult {
     tunnel_interface: TunnelInterface,
     tunnel_conn_data: TunnelConnectionData,
     tunnel_handle: AnyTunnelHandle,
+}
+
+struct WgTunnelRuntime {
+    bandwidth_controller_handle: JoinHandle<()>,
+    transport_fwd_handle: Option<JoinHandle<()>>,
+    authenticator_listener_handle: Option<AuthClientMixnetListenerHandle>,
+}
+
+impl WgTunnelRuntime {
+    // Returns the mixnet cancellation token, to monitor mixnet client unexpected stop.
+    // Returns None if we already stopped it (in new Wireguard mode) and we don't need to monitor it.
+    fn mixnet_client_token(&self) -> Option<CancellationToken> {
+        self.authenticator_listener_handle
+            .as_ref()
+            .map(|handle| handle.mixnet_cancel_token())
+    }
 }
