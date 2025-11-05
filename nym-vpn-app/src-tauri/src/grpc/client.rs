@@ -651,7 +651,7 @@ impl GrpcClient {
         &self,
         socks5_settings: Socks5Settings,
         http_rpc_settings: HttpRpcSettings,
-        exit_node: NodeConnect,
+        exit_node: Node,
     ) -> Result<(), VpndError> {
         let mut vpnd = self.vpnd().await?;
 

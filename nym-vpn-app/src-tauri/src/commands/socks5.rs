@@ -2,7 +2,7 @@ use tauri::State;
 use tracing::{info, instrument};
 
 use crate::error::BackendError;
-use crate::grpc::client::{GrpcClient, NodeConnect};
+use crate::grpc::client::{GrpcClient, Node};
 use crate::grpc::socks5::{Socks5Settings, HttpRpcSettings, Socks5Status};
 
 #[instrument(skip_all)]
@@ -11,7 +11,7 @@ pub async fn enable_socks5(
     grpc: State<'_, GrpcClient>,
     socks5_settings: Socks5Settings,
     http_rpc_settings: HttpRpcSettings,
-    exit: NodeConnect,
+    exit: Node,
 ) -> Result<(), BackendError> {
     info!("enabling SOCKS5 proxy with exit_node: {}", exit);
     grpc.enable_socks5(socks5_settings, http_rpc_settings, exit).await?;
