@@ -204,6 +204,7 @@ impl LazySocks5 {
         );
 
         // Connect directly to the target (routes through dVPN tunnel)
+        // DNS resolution happens through the VPN tunnel, preserving privacy
         let target_stream = match TcpStream::connect(&target_addr).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -211,7 +212,7 @@ impl LazySocks5 {
                     "Failed to connect to target {} from {}: {}",
                     target_addr, client_addr, e
                 );
-                // Send SOCKS5 error response
+                // Send SOCKS5 error response with a dummy bind address
                 let reply_code = if e.kind() == std::io::ErrorKind::ConnectionRefused {
                     0x05 // Connection refused
                 } else if e.kind() == std::io::ErrorKind::TimedOut {
@@ -219,7 +220,9 @@ impl LazySocks5 {
                 } else {
                     0x04 // Host unreachable
                 };
-                let _ = Self::send_socks5_reply(&mut client_stream, reply_code, target_addr).await;
+                // Use unspecified address for error responses
+                let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+                let _ = Self::send_socks5_reply(&mut client_stream, reply_code, dummy_addr).await;
                 self.decrement_connections().await;
                 return Err(LazySocks5Error::Internal(format!(
                     "Failed to connect to target: {}",
@@ -233,8 +236,13 @@ impl LazySocks5 {
             client_addr, target_addr
         );
 
-        // Send SOCKS5 success response
-        if let Err(e) = Self::send_socks5_reply(&mut client_stream, 0x00, target_addr).await {
+        // Get the local address of the established connection for SOCKS5 reply
+        let bind_addr = target_stream
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+
+        // Send SOCKS5 success response with the actual bind address
+        if let Err(e) = Self::send_socks5_reply(&mut client_stream, 0x00, bind_addr).await {
             error!(
                 "Failed to send SOCKS5 success response to {}: {}",
                 client_addr, e
@@ -270,7 +278,8 @@ impl LazySocks5 {
     }
 
     /// Perform SOCKS5 handshake and parse the target address
-    async fn socks5_handshake(stream: &mut TcpStream) -> Result<SocketAddr, LazySocks5Error> {
+    /// Returns a string in "host:port" format to allow DNS resolution through the VPN tunnel
+    async fn socks5_handshake(stream: &mut TcpStream) -> Result<String, LazySocks5Error> {
         // Read version and number of auth methods
         let mut buf = [0u8; 2];
         stream.read_exact(&mut buf).await.map_err(|e| {
@@ -325,17 +334,18 @@ impl LazySocks5 {
         }
 
         // Parse destination address based on address type
-        let addr: IpAddr = match atyp {
+        let host: String = match atyp {
             0x01 => {
                 // IPv4
                 let mut buf = [0u8; 4];
                 stream.read_exact(&mut buf).await.map_err(|e| {
                     LazySocks5Error::Internal(format!("Failed to read IPv4 address: {}", e))
                 })?;
-                IpAddr::V4(Ipv4Addr::from(buf))
+                Ipv4Addr::from(buf).to_string()
             }
             0x03 => {
-                // Domain name
+                // Domain name - DO NOT resolve locally to preserve privacy!
+                // Let TcpStream::connect handle DNS through the VPN tunnel
                 let mut len_buf = [0u8; 1];
                 stream.read_exact(&mut len_buf).await.map_err(|e| {
                     LazySocks5Error::Internal(format!("Failed to read domain length: {}", e))
@@ -347,30 +357,8 @@ impl LazySocks5 {
                     LazySocks5Error::Internal(format!("Failed to read domain name: {}", e))
                 })?;
 
-                let domain = String::from_utf8(domain_buf).map_err(|e| {
-                    LazySocks5Error::Internal(format!("Invalid domain name: {}", e))
-                })?;
-
-                // Resolve domain to IP
-                let addrs = tokio::net::lookup_host(format!("{}:0", domain))
-                    .await
-                    .map_err(|e| {
-                        LazySocks5Error::Internal(format!(
-                            "Failed to resolve domain {}: {}",
-                            domain, e
-                        ))
-                    })?;
-
-                addrs
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        LazySocks5Error::Internal(format!(
-                            "No addresses found for domain {}",
-                            domain
-                        ))
-                    })?
-                    .ip()
+                String::from_utf8(domain_buf)
+                    .map_err(|e| LazySocks5Error::Internal(format!("Invalid domain name: {}", e)))?
             }
             0x04 => {
                 // IPv6
@@ -378,7 +366,7 @@ impl LazySocks5 {
                 stream.read_exact(&mut buf).await.map_err(|e| {
                     LazySocks5Error::Internal(format!("Failed to read IPv6 address: {}", e))
                 })?;
-                IpAddr::V6(Ipv6Addr::from(buf))
+                Ipv6Addr::from(buf).to_string()
             }
             _ => {
                 return Err(LazySocks5Error::Internal(format!(
@@ -396,7 +384,8 @@ impl LazySocks5 {
             .map_err(|e| LazySocks5Error::Internal(format!("Failed to read port: {}", e)))?;
         let port = u16::from_be_bytes(port_buf);
 
-        Ok(SocketAddr::new(addr, port))
+        // Return "host:port" format - TcpStream::connect will handle DNS resolution through VPN
+        Ok(format!("{}:{}", host, port))
     }
 
     /// Send SOCKS5 reply
